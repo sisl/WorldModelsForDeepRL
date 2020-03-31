@@ -1,0 +1,596 @@
+Model: <class 'models.worldmodel.controller.Controller'>, Env: defend_the_line/iter1/, Date: 22/03/2020 05:28:51
+CPU: 8 Core, 5.0GHz, 62.66 GB, Linux-5.3.0-42-generic-x86_64-with-Ubuntu-18.04-bionic
+GPU 0: GeForce RTX 2070, 7.98 GB (Driver: 440.64.00)
+Git URL: git@github.com:shawnmanuel000/WorldModelsForDeepRL.git
+Hash: 605e7742be94b5e71647b1eb63330b89482c7bf2
+Branch: master
+
+popsize: 64,
+restarts: 1,
+
+import os
+import torch
+import numpy as np
+from utils.rand import RandomAgent
+from utils.wrappers import WorldModel
+from models.worldmodel.vae import LATENT_SIZE
+from models.worldmodel.mdrnn import HIDDEN_SIZE, ACTION_SIZE
+
+class ControlActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.linear = torch.nn.Linear(state_size[-1], action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) == torch.nn.Linear else None)
+
+	def forward(self, state):
+		action = self.linear(state)
+		return action
+
+class Controller():
+	def __init__(self, state_size=[LATENT_SIZE+HIDDEN_SIZE], action_size=[ACTION_SIZE], gpu=True, load=""):
+		super().__init__()
+		self.device = torch.device('cuda' if gpu and torch.cuda.is_available() else 'cpu')
+		self.actor_local = ControlActor(state_size, action_size).to(self.device)
+		if load: self.load_model(load)
+
+	def get_action(self, state):
+		with torch.no_grad():
+			action = self.actor_local(state.to(self.device)).clamp(-1, 1)
+			return action.cpu().numpy()
+
+	def get_params(self):
+		params = [p.view(-1) for p in self.actor_local.parameters()]
+		params = torch.cat(params, dim=0)
+		return params.cpu().detach().numpy()
+
+	def set_params(self, params):
+		numels = [p.numel() for p in self.actor_local.parameters()]
+		starts = np.cumsum([0] + numels)
+		params = [params[s:starts[i+1]] for i,s in enumerate(starts[:-1])]
+		for p,d in zip(self.actor_local.parameters(), params):
+			p.data.copy_(torch.Tensor(d).view(p.size()))
+		return self
+
+	def save_model(self, dirname="pytorch", name="best"):
+		filepath = get_checkpoint_path(dirname, name)
+		os.makedirs(os.path.dirname(filepath), exist_ok=True)
+		torch.save(self.actor_local.state_dict(), filepath)
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		filepath = get_checkpoint_path(dirname, name)
+		if os.path.exists(filepath):
+			self.actor_local.load_state_dict(torch.load(filepath, map_location=self.device))
+			print(f"Loaded CTRL model at {filepath}")
+		return self
+
+class ControlAgent(RandomAgent):
+	def __init__(self, state_size, action_size, gpu=True, load=""):
+		super().__init__(state_size, action_size)
+		self.world_model = WorldModel(state_size, action_size, num_envs=1, load=load, gpu=gpu)
+		self.network = Controller(self.world_model.state_size, action_size, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True):
+		state, self.latent = self.world_model.get_state(state, numpy=False)
+		action = self.network.get_action(state)
+		return action
+
+	def get_env_action(self, env, state, eps=None, sample=False):
+		env_action, action = super().get_env_action(env, state, eps)
+		self.world_model.step(self.latent, env_action)
+		return env_action, action
+
+	def set_params(self, params):
+		self.network.set_params(params)
+		return self
+
+	def save_model(self, dirname="pytorch", name="best"):
+		self.network.save_model(dirname, name)
+
+	def load_model(self, dirname="pytorch", name="best"):
+		self.world_model.load_model(dirname, name)
+		self.network.load_model(dirname, name)
+		return self
+
+def get_checkpoint_path(dirname="pytorch", name="best"):
+	return f"./saved_models/controller/{dirname}/{name}.pth"
+
+Ep: 0-499, Best score: 24.0000, Min: -1.0000, Avg: 11.2969, Rolling: 11.2969 <0-00:00:00> 
+Ep: 0-498, Best score: 19.0000, Min: 2.0000, Avg: 10.6719, Rolling: 10.9844 <0-00:00:33> 
+Ep: 0-497, Best score: 28.0000, Min: 2.0000, Avg: 11.8594, Rolling: 11.2760 <0-00:01:11> 
+Ep: 0-496, Best score: 28.0000, Min: 2.0000, Avg: 12.2969, Rolling: 11.5312 <0-00:01:48> 
+Ep: 0-495, Best score: 27.0000, Min: 5.0000, Avg: 13.3594, Rolling: 11.8969 <0-00:02:29> 
+Ep: 0-494, Best score: 24.0000, Min: 3.0000, Avg: 12.8594, Rolling: 12.0573 <0-00:03:06> 
+Ep: 0-493, Best score: 23.0000, Min: 3.0000, Avg: 12.9375, Rolling: 12.1830 <0-00:03:44> 
+Ep: 0-492, Best score: 23.0000, Min: 4.0000, Avg: 13.0156, Rolling: 12.2871 <0-00:04:21> 
+Ep: 0-491, Best score: 23.0000, Min: 3.0000, Avg: 12.5469, Rolling: 12.3160 <0-00:04:58> 
+Ep: 0-490, Best score: 24.0000, Min: 3.0000, Avg: 12.5625, Rolling: 12.3406 <0-00:05:33> 
+Ep: 0-489, Best score: 32.0000, Min: 3.0000, Avg: 12.5000, Rolling: 12.3551 <0-00:06:11> 
+Ep: 0-488, Best score: 23.0000, Min: 3.0000, Avg: 13.4531, Rolling: 12.4466 <0-00:06:49> 
+Ep: 0-487, Best score: 22.0000, Min: 2.0000, Avg: 12.5938, Rolling: 12.4579 <0-00:07:27> 
+Ep: 0-486, Best score: 26.0000, Min: 2.0000, Avg: 13.8438, Rolling: 12.5569 <0-00:08:07> 
+Ep: 0-485, Best score: 26.0000, Min: 3.0000, Avg: 13.1562, Rolling: 12.5969 <0-00:08:46> 
+Ep: 0-484, Best score: 27.0000, Min: 1.0000, Avg: 13.5938, Rolling: 12.6592 <0-00:09:27> 
+Ep: 0-483, Best score: 25.0000, Min: 3.0000, Avg: 14.5312, Rolling: 12.7693 <0-00:10:08> 
+Ep: 0-482, Best score: 25.0000, Min: 4.0000, Avg: 13.5312, Rolling: 12.8116 <0-00:10:45> 
+Ep: 0-481, Best score: 29.0000, Min: 4.0000, Avg: 14.5625, Rolling: 12.9038 <0-00:11:26> 
+Ep: 0-480, Best score: 28.0000, Min: 3.0000, Avg: 14.8281, Rolling: 13.0000 <0-00:12:07> 
+Ep: 0-479, Best score: 32.0000, Min: 6.0000, Avg: 14.7344, Rolling: 13.0826 <0-00:12:48> 
+Ep: 0-478, Best score: 25.0000, Min: 4.0000, Avg: 14.0625, Rolling: 13.1271 <0-00:13:28> 
+Ep: 0-477, Best score: 24.0000, Min: 3.0000, Avg: 14.2031, Rolling: 13.1739 <0-00:14:06> 
+Ep: 0-476, Best score: 28.0000, Min: 2.0000, Avg: 14.5469, Rolling: 13.2311 <0-00:14:47> 
+Ep: 0-475, Best score: 26.0000, Min: 4.0000, Avg: 14.7812, Rolling: 13.2931 <0-00:15:28> 
+Ep: 0-474, Best score: 29.0000, Min: 4.0000, Avg: 14.7812, Rolling: 13.3504 <0-00:16:11> 
+Ep: 0-473, Best score: 25.0000, Min: 2.0000, Avg: 16.0312, Rolling: 13.4497 <0-00:16:54> 
+Ep: 0-472, Best score: 26.0000, Min: 4.0000, Avg: 14.2500, Rolling: 13.4782 <0-00:17:33> 
+Ep: 0-471, Best score: 31.0000, Min: 6.0000, Avg: 15.8125, Rolling: 13.5587 <0-00:18:16> 
+Ep: 0-470, Best score: 26.0000, Min: 4.0000, Avg: 13.7188, Rolling: 13.5641 <0-00:18:55> 
+Ep: 0-469, Best score: 34.0000, Min: 2.0000, Avg: 14.3438, Rolling: 13.5892 <0-00:19:38> 
+Ep: 0-468, Best score: 39.0000, Min: 4.0000, Avg: 14.7969, Rolling: 13.6270 <0-00:20:19> 
+Ep: 0-467, Best score: 26.0000, Min: 4.0000, Avg: 14.4219, Rolling: 13.6510 <0-00:20:59> 
+Ep: 0-466, Best score: 24.0000, Min: 5.0000, Avg: 13.6719, Rolling: 13.6517 <0-00:21:37> 
+Ep: 0-465, Best score: 25.0000, Min: 2.0000, Avg: 14.3438, Rolling: 13.6714 <0-00:22:17> 
+Ep: 0-464, Best score: 27.0000, Min: 3.0000, Avg: 13.5938, Rolling: 13.6693 <0-00:22:56> 
+Ep: 0-463, Best score: 25.0000, Min: 3.0000, Avg: 14.2500, Rolling: 13.6850 <0-00:23:36> 
+Ep: 0-462, Best score: 24.0000, Min: 5.0000, Avg: 14.6094, Rolling: 13.7093 <0-00:24:16> 
+Ep: 0-461, Best score: 23.0000, Min: 5.0000, Avg: 13.8438, Rolling: 13.7127 <0-00:24:53> 
+Ep: 0-460, Best score: 28.0000, Min: 5.0000, Avg: 15.2344, Rolling: 13.7508 <0-00:25:34> 
+Ep: 0-459, Best score: 26.0000, Min: 3.0000, Avg: 15.6094, Rolling: 13.7961 <0-00:26:17> 
+Ep: 0-458, Best score: 26.0000, Min: 5.0000, Avg: 14.0938, Rolling: 13.8032 <0-00:26:56> 
+Ep: 0-457, Best score: 29.0000, Min: 4.0000, Avg: 16.0625, Rolling: 13.8557 <0-00:27:39> 
+Ep: 0-456, Best score: 31.0000, Min: 4.0000, Avg: 14.4062, Rolling: 13.8683 <0-00:28:19> 
+Ep: 0-455, Best score: 29.0000, Min: 4.0000, Avg: 14.7500, Rolling: 13.8878 <0-00:29:00> 
+Ep: 0-454, Best score: 27.0000, Min: 6.0000, Avg: 14.9688, Rolling: 13.9113 <0-00:29:42> 
+Ep: 0-453, Best score: 26.0000, Min: 2.0000, Avg: 14.1250, Rolling: 13.9159 <0-00:30:21> 
+Ep: 0-452, Best score: 27.0000, Min: 5.0000, Avg: 14.9688, Rolling: 13.9378 <0-00:31:03> 
+Ep: 0-451, Best score: 27.0000, Min: 4.0000, Avg: 13.6250, Rolling: 13.9314 <0-00:31:40> 
+Ep: 0-450, Best score: 28.0000, Min: 6.0000, Avg: 15.6250, Rolling: 13.9653 <0-00:32:23> 
+Ep: 0-449, Best score: 33.0000, Min: 5.0000, Avg: 14.5938, Rolling: 13.9776 <0-00:33:03> 
+Ep: 0-448, Best score: 31.0000, Min: 5.0000, Avg: 15.1250, Rolling: 13.9997 <0-00:33:43> 
+Ep: 0-447, Best score: 31.0000, Min: 5.0000, Avg: 16.2969, Rolling: 14.0430 <0-00:34:28> 
+Ep: 0-446, Best score: 27.0000, Min: 4.0000, Avg: 14.3125, Rolling: 14.0480 <0-00:35:07> 
+Ep: 0-445, Best score: 26.0000, Min: 6.0000, Avg: 13.9531, Rolling: 14.0463 <0-00:35:47> 
+Ep: 0-444, Best score: 27.0000, Min: 2.0000, Avg: 13.8438, Rolling: 14.0427 <0-00:36:25> 
+Ep: 0-443, Best score: 33.0000, Min: 3.0000, Avg: 14.4219, Rolling: 14.0493 <0-00:37:06> 
+Ep: 0-442, Best score: 24.0000, Min: 5.0000, Avg: 14.0938, Rolling: 14.0501 <0-00:37:45> 
+Ep: 0-441, Best score: 29.0000, Min: 4.0000, Avg: 14.4531, Rolling: 14.0569 <0-00:38:24> 
+Ep: 0-440, Best score: 26.0000, Min: 5.0000, Avg: 13.9844, Rolling: 14.0557 <0-00:39:03> 
+Ep: 0-439, Best score: 33.0000, Min: 5.0000, Avg: 14.7344, Rolling: 14.0669 <0-00:39:45> 
+Ep: 0-438, Best score: 25.0000, Min: 5.0000, Avg: 14.8281, Rolling: 14.0791 <0-00:40:26> 
+Ep: 0-437, Best score: 25.0000, Min: 3.0000, Avg: 13.3750, Rolling: 14.0680 <0-00:41:03> 
+Ep: 0-436, Best score: 32.0000, Min: 5.0000, Avg: 14.2344, Rolling: 14.0706 <0-00:41:42> 
+Ep: 0-435, Best score: 26.0000, Min: 5.0000, Avg: 14.2188, Rolling: 14.0728 <0-00:42:22> 
+Ep: 0-434, Best score: 30.0000, Min: 3.0000, Avg: 15.1875, Rolling: 14.0897 <0-00:43:04> 
+Ep: 0-433, Best score: 25.0000, Min: 4.0000, Avg: 15.1250, Rolling: 14.1052 <0-00:43:46> 
+Ep: 0-432, Best score: 25.0000, Min: 5.0000, Avg: 14.7812, Rolling: 14.1151 <0-00:44:26> 
+Ep: 0-431, Best score: 26.0000, Min: 2.0000, Avg: 13.6875, Rolling: 14.1089 <0-00:45:03> 
+Ep: 0-430, Best score: 30.0000, Min: 3.0000, Avg: 15.0156, Rolling: 14.1219 <0-00:45:44> 
+Ep: 0-429, Best score: 25.0000, Min: 4.0000, Avg: 15.4062, Rolling: 14.1400 <0-00:46:25> 
+Ep: 0-428, Best score: 30.0000, Min: 5.0000, Avg: 15.5469, Rolling: 14.1595 <0-00:47:07> 
+Ep: 0-427, Best score: 28.0000, Min: 4.0000, Avg: 14.6094, Rolling: 14.1657 <0-00:47:47> 
+Ep: 0-426, Best score: 27.0000, Min: 6.0000, Avg: 16.0000, Rolling: 14.1905 <0-00:48:30> 
+Ep: 0-425, Best score: 26.0000, Min: 7.0000, Avg: 15.2500, Rolling: 14.2046 <0-00:49:11> 
+Ep: 0-424, Best score: 28.0000, Min: 4.0000, Avg: 14.4219, Rolling: 14.2074 <0-00:49:52> 
+Ep: 0-423, Best score: 28.0000, Min: 4.0000, Avg: 15.5156, Rolling: 14.2244 <0-00:50:33> 
+Ep: 0-422, Best score: 30.0000, Min: 3.0000, Avg: 15.0781, Rolling: 14.2354 <0-00:51:15> 
+Ep: 0-421, Best score: 27.0000, Min: 3.0000, Avg: 15.0938, Rolling: 14.2462 <0-00:51:57> 
+Ep: 0-420, Best score: 32.0000, Min: 7.0000, Avg: 15.5625, Rolling: 14.2627 <0-00:52:38> 
+Ep: 0-419, Best score: 27.0000, Min: 6.0000, Avg: 15.4844, Rolling: 14.2778 <0-00:53:20> 
+Ep: 0-418, Best score: 26.0000, Min: 5.0000, Avg: 15.2344, Rolling: 14.2894 <0-00:54:01> 
+Ep: 0-417, Best score: 23.0000, Min: 4.0000, Avg: 14.9688, Rolling: 14.2976 <0-00:54:41> 
+Ep: 0-416, Best score: 28.0000, Min: 5.0000, Avg: 16.3125, Rolling: 14.3216 <0-00:55:23> 
+Ep: 0-415, Best score: 32.0000, Min: 4.0000, Avg: 15.9844, Rolling: 14.3412 <0-00:56:06> 
+Ep: 0-414, Best score: 32.0000, Min: 5.0000, Avg: 15.6094, Rolling: 14.3559 <0-00:56:49> 
+Ep: 0-413, Best score: 27.0000, Min: 4.0000, Avg: 15.6406, Rolling: 14.3707 <0-00:57:31> 
+Ep: 0-412, Best score: 30.0000, Min: 5.0000, Avg: 16.3438, Rolling: 14.3931 <0-00:58:12> 
+Ep: 0-411, Best score: 24.0000, Min: 3.0000, Avg: 15.9688, Rolling: 14.4108 <0-00:58:54> 
+Ep: 0-410, Best score: 30.0000, Min: 3.0000, Avg: 15.1250, Rolling: 14.4187 <0-00:59:35> 
+Ep: 0-409, Best score: 28.0000, Min: 7.0000, Avg: 14.8438, Rolling: 14.4234 <0-01:00:15> 
+Ep: 0-408, Best score: 28.0000, Min: 6.0000, Avg: 14.9062, Rolling: 14.4287 <0-01:00:55> 
+Ep: 0-407, Best score: 28.0000, Min: 7.0000, Avg: 16.2031, Rolling: 14.4477 <0-01:01:36> 
+Ep: 0-406, Best score: 29.0000, Min: 3.0000, Avg: 16.3438, Rolling: 14.4679 <0-01:02:17> 
+Ep: 0-405, Best score: 27.0000, Min: 5.0000, Avg: 15.4688, Rolling: 14.4785 <0-01:02:58> 
+Ep: 0-404, Best score: 27.0000, Min: 4.0000, Avg: 16.4844, Rolling: 14.4993 <0-01:03:41> 
+Ep: 0-403, Best score: 27.0000, Min: 6.0000, Avg: 15.3906, Rolling: 14.5085 <0-01:04:22> 
+Ep: 0-402, Best score: 28.0000, Min: 6.0000, Avg: 15.9219, Rolling: 14.5230 <0-01:05:04> 
+Ep: 0-401, Best score: 27.0000, Min: 5.0000, Avg: 16.3438, Rolling: 14.5414 <0-01:05:46> 
+Ep: 0-400, Best score: 38.0000, Min: 5.0000, Avg: 15.3906, Rolling: 14.5498 <0-01:06:27> 
+Ep: 0-399, Best score: 29.0000, Min: 5.0000, Avg: 16.0312, Rolling: 14.5645 <0-01:07:10> 
+Ep: 0-398, Best score: 26.0000, Min: 5.0000, Avg: 14.6875, Rolling: 14.5657 <0-01:07:48> 
+Ep: 0-397, Best score: 28.0000, Min: 9.0000, Avg: 16.4531, Rolling: 14.5840 <0-01:08:31> 
+Ep: 0-396, Best score: 26.0000, Min: 6.0000, Avg: 16.2031, Rolling: 14.5996 <0-01:09:14> 
+Ep: 0-395, Best score: 31.0000, Min: 6.0000, Avg: 16.1719, Rolling: 14.6146 <0-01:09:55> 
+Ep: 0-394, Best score: 27.0000, Min: 5.0000, Avg: 15.2500, Rolling: 14.6206 <0-01:10:35> 
+Ep: 0-393, Best score: 28.0000, Min: 7.0000, Avg: 16.3281, Rolling: 14.6365 <0-01:11:19> 
+Ep: 0-392, Best score: 28.0000, Min: 7.0000, Avg: 17.0312, Rolling: 14.6587 <0-01:12:03> 
+Ep: 0-391, Best score: 27.0000, Min: 7.0000, Avg: 16.7656, Rolling: 14.6780 <0-01:12:46> 
+Ep: 0-390, Best score: 29.0000, Min: 5.0000, Avg: 16.4219, Rolling: 14.6939 <0-01:13:29> 
+Ep: 0-389, Best score: 28.0000, Min: 4.0000, Avg: 17.1719, Rolling: 14.7162 <0-01:14:15> 
+Ep: 0-388, Best score: 28.0000, Min: 8.0000, Avg: 15.9688, Rolling: 14.7274 <0-01:14:56> 
+Ep: 0-387, Best score: 29.0000, Min: 5.0000, Avg: 15.6406, Rolling: 14.7355 <0-01:15:39> 
+Ep: 0-386, Best score: 25.0000, Min: 4.0000, Avg: 15.1875, Rolling: 14.7394 <0-01:16:19> 
+Ep: 0-385, Best score: 25.0000, Min: 6.0000, Avg: 14.9375, Rolling: 14.7412 <0-01:16:59> 
+Ep: 0-384, Best score: 28.0000, Min: 2.0000, Avg: 15.1562, Rolling: 14.7447 <0-01:17:37> 
+Ep: 0-383, Best score: 27.0000, Min: 3.0000, Avg: 15.6250, Rolling: 14.7523 <0-01:18:19> 
+Ep: 0-382, Best score: 25.0000, Min: 6.0000, Avg: 15.1562, Rolling: 14.7557 <0-01:18:58> 
+Ep: 0-381, Best score: 30.0000, Min: 5.0000, Avg: 15.0312, Rolling: 14.7580 <0-01:19:38> 
+Ep: 0-380, Best score: 27.0000, Min: 7.0000, Avg: 16.4062, Rolling: 14.7717 <0-01:20:20> 
+Ep: 0-379, Best score: 33.0000, Min: 4.0000, Avg: 15.1719, Rolling: 14.7751 <0-01:21:01> 
+Ep: 0-378, Best score: 32.0000, Min: 5.0000, Avg: 15.4688, Rolling: 14.7807 <0-01:21:42> 
+Ep: 0-377, Best score: 26.0000, Min: 4.0000, Avg: 15.1719, Rolling: 14.7839 <0-01:22:22> 
+Ep: 0-376, Best score: 28.0000, Min: 4.0000, Avg: 15.2656, Rolling: 14.7878 <0-01:23:03> 
+Ep: 0-375, Best score: 25.0000, Min: 3.0000, Avg: 14.7969, Rolling: 14.7879 <0-01:23:41> 
+Ep: 0-374, Best score: 26.0000, Min: 5.0000, Avg: 15.3438, Rolling: 14.7923 <0-01:24:23> 
+Ep: 0-373, Best score: 27.0000, Min: 3.0000, Avg: 14.8438, Rolling: 14.7927 <0-01:25:03> 
+Ep: 0-372, Best score: 25.0000, Min: 4.0000, Avg: 14.9688, Rolling: 14.7941 <0-01:25:42> 
+Ep: 0-371, Best score: 30.0000, Min: 7.0000, Avg: 16.1094, Rolling: 14.8043 <0-01:26:26> 
+Ep: 0-370, Best score: 26.0000, Min: 6.0000, Avg: 14.2031, Rolling: 14.7996 <0-01:27:05> 
+Ep: 0-369, Best score: 27.0000, Min: 4.0000, Avg: 16.0625, Rolling: 14.8093 <0-01:27:49> 
+Ep: 0-368, Best score: 28.0000, Min: 6.0000, Avg: 15.5625, Rolling: 14.8150 <0-01:28:34> 
+Ep: 0-367, Best score: 28.0000, Min: 5.0000, Avg: 14.0312, Rolling: 14.8091 <0-01:29:13> 
+Ep: 0-366, Best score: 34.0000, Min: 5.0000, Avg: 15.5312, Rolling: 14.8145 <0-01:29:54> 
+Ep: 0-365, Best score: 25.0000, Min: 4.0000, Avg: 15.2188, Rolling: 14.8175 <0-01:30:35> 
+Ep: 0-364, Best score: 29.0000, Min: 5.0000, Avg: 14.6562, Rolling: 14.8163 <0-01:31:15> 
+Ep: 0-363, Best score: 26.0000, Min: 5.0000, Avg: 16.2656, Rolling: 14.8269 <0-01:31:59> 
+Ep: 0-362, Best score: 27.0000, Min: 3.0000, Avg: 14.6875, Rolling: 14.8259 <0-01:32:40> 
+Ep: 0-361, Best score: 27.0000, Min: 4.0000, Avg: 14.5000, Rolling: 14.8235 <0-01:33:18> 
+Ep: 0-360, Best score: 29.0000, Min: 5.0000, Avg: 15.2812, Rolling: 14.8268 <0-01:33:58> 
+Ep: 0-359, Best score: 30.0000, Min: 4.0000, Avg: 16.2969, Rolling: 14.8372 <0-01:34:41> 
+Ep: 0-358, Best score: 27.0000, Min: 5.0000, Avg: 15.1719, Rolling: 14.8396 <0-01:35:21> 
+Ep: 0-357, Best score: 31.0000, Min: 4.0000, Avg: 14.6562, Rolling: 14.8383 <0-01:36:03> 
+Ep: 0-356, Best score: 28.0000, Min: 4.0000, Avg: 15.0469, Rolling: 14.8397 <0-01:36:44> 
+Ep: 0-355, Best score: 27.0000, Min: 6.0000, Avg: 14.7969, Rolling: 14.8394 <0-01:37:23> 
+Ep: 0-354, Best score: 25.0000, Min: 7.0000, Avg: 15.7656, Rolling: 14.8458 <0-01:38:04> 
+Ep: 0-353, Best score: 29.0000, Min: 3.0000, Avg: 15.7344, Rolling: 14.8518 <0-01:38:47> 
+Ep: 0-352, Best score: 33.0000, Min: 6.0000, Avg: 15.6406, Rolling: 14.8572 <0-01:39:28> 
+Ep: 0-351, Best score: 28.0000, Min: 5.0000, Avg: 15.2812, Rolling: 14.8600 <0-01:40:10> 
+Ep: 0-350, Best score: 27.0000, Min: 4.0000, Avg: 14.3594, Rolling: 14.8567 <0-01:40:49> 
+Ep: 0-349, Best score: 30.0000, Min: 5.0000, Avg: 15.0469, Rolling: 14.8579 <0-01:41:30> 
+Ep: 0-348, Best score: 29.0000, Min: 6.0000, Avg: 16.3281, Rolling: 14.8676 <0-01:42:14> 
+Ep: 0-347, Best score: 27.0000, Min: 3.0000, Avg: 15.9688, Rolling: 14.8748 <0-01:42:56> 
+Ep: 0-346, Best score: 27.0000, Min: 5.0000, Avg: 15.9219, Rolling: 14.8816 <0-01:43:38> 
+Ep: 0-345, Best score: 23.0000, Min: 5.0000, Avg: 13.6094, Rolling: 14.8734 <0-01:44:15> 
+Ep: 0-344, Best score: 29.0000, Min: 5.0000, Avg: 15.8125, Rolling: 14.8794 <0-01:44:57> 
+Ep: 0-343, Best score: 32.0000, Min: 2.0000, Avg: 16.1719, Rolling: 14.8876 <0-01:45:43> 
+Ep: 0-342, Best score: 24.0000, Min: 4.0000, Avg: 15.3281, Rolling: 14.8904 <0-01:46:24> 
+Ep: 0-341, Best score: 24.0000, Min: 3.0000, Avg: 13.8438, Rolling: 14.8838 <0-01:47:02> 
+Ep: 0-340, Best score: 33.0000, Min: 4.0000, Avg: 15.9375, Rolling: 14.8904 <0-01:47:45> 
+Ep: 0-339, Best score: 32.0000, Min: 3.0000, Avg: 14.8125, Rolling: 14.8899 <0-01:48:25> 
+Ep: 0-338, Best score: 33.0000, Min: 3.0000, Avg: 15.3281, Rolling: 14.8927 <0-01:49:09> 
+Ep: 0-337, Best score: 30.0000, Min: 4.0000, Avg: 14.6562, Rolling: 14.8912 <0-01:49:51> 
+Ep: 0-336, Best score: 26.0000, Min: 5.0000, Avg: 14.3594, Rolling: 14.8880 <0-01:50:31> 
+Ep: 0-335, Best score: 34.0000, Min: 4.0000, Avg: 15.0625, Rolling: 14.8890 <0-01:51:14> 
+Ep: 0-334, Best score: 27.0000, Min: 2.0000, Avg: 14.8281, Rolling: 14.8886 <0-01:51:54> 
+Ep: 0-333, Best score: 27.0000, Min: 3.0000, Avg: 13.8906, Rolling: 14.8827 <0-01:52:35> 
+Ep: 0-332, Best score: 29.0000, Min: 4.0000, Avg: 15.7656, Rolling: 14.8879 <0-01:53:18> 
+Ep: 0-331, Best score: 26.0000, Min: 3.0000, Avg: 14.8750, Rolling: 14.8879 <0-01:53:58> 
+Ep: 0-330, Best score: 32.0000, Min: 3.0000, Avg: 15.2969, Rolling: 14.8903 <0-01:54:39> 
+Ep: 0-329, Best score: 26.0000, Min: 2.0000, Avg: 14.5469, Rolling: 14.8882 <0-01:55:20> 
+Ep: 0-328, Best score: 32.0000, Min: 5.0000, Avg: 15.3750, Rolling: 14.8911 <0-01:56:02> 
+Ep: 0-327, Best score: 28.0000, Min: 3.0000, Avg: 16.2500, Rolling: 14.8989 <0-01:56:45> 
+Ep: 0-326, Best score: 30.0000, Min: 7.0000, Avg: 15.7188, Rolling: 14.9036 <0-01:57:25> 
+Ep: 0-325, Best score: 29.0000, Min: 8.0000, Avg: 15.6875, Rolling: 14.9081 <0-01:58:08> 
+Ep: 0-324, Best score: 31.0000, Min: 6.0000, Avg: 16.6562, Rolling: 14.9181 <0-01:58:52> 
+Ep: 0-323, Best score: 25.0000, Min: 4.0000, Avg: 15.5938, Rolling: 14.9219 <0-01:59:33> 
+Ep: 0-322, Best score: 27.0000, Min: 3.0000, Avg: 15.1250, Rolling: 14.9230 <0-02:00:16> 
+Ep: 0-321, Best score: 25.0000, Min: 2.0000, Avg: 15.2656, Rolling: 14.9249 <0-02:00:57> 
+Ep: 0-320, Best score: 26.0000, Min: 3.0000, Avg: 14.5938, Rolling: 14.9231 <0-02:01:36> 
+Ep: 0-319, Best score: 24.0000, Min: 5.0000, Avg: 14.5781, Rolling: 14.9212 <0-02:02:14> 
+Ep: 0-318, Best score: 37.0000, Min: 6.0000, Avg: 16.0469, Rolling: 14.9274 <0-02:02:59> 
+Ep: 0-317, Best score: 35.0000, Min: 7.0000, Avg: 15.3594, Rolling: 14.9297 <0-02:03:40> 
+Ep: 0-316, Best score: 26.0000, Min: 6.0000, Avg: 14.4375, Rolling: 14.9271 <0-02:04:19> 
+Ep: 0-315, Best score: 30.0000, Min: 6.0000, Avg: 15.1719, Rolling: 14.9284 <0-02:04:59> 
+Ep: 0-314, Best score: 25.0000, Min: 5.0000, Avg: 14.8750, Rolling: 14.9281 <0-02:05:39> 
+Ep: 0-313, Best score: 26.0000, Min: 5.0000, Avg: 15.3125, Rolling: 14.9301 <0-02:06:21> 
+Ep: 0-312, Best score: 28.0000, Min: 5.0000, Avg: 15.9375, Rolling: 14.9355 <0-02:07:03> 
+Ep: 0-311, Best score: 29.0000, Min: 6.0000, Avg: 15.1562, Rolling: 14.9367 <0-02:07:43> 
+Ep: 0-310, Best score: 29.0000, Min: 6.0000, Avg: 14.7812, Rolling: 14.9359 <0-02:08:23> 
+Ep: 0-309, Best score: 29.0000, Min: 6.0000, Avg: 15.9219, Rolling: 14.9410 <0-02:09:07> 
+Ep: 0-308, Best score: 29.0000, Min: 3.0000, Avg: 15.2344, Rolling: 14.9425 <0-02:09:50> 
+Ep: 0-307, Best score: 25.0000, Min: 3.0000, Avg: 14.9062, Rolling: 14.9424 <0-02:10:32> 
+Ep: 0-306, Best score: 29.0000, Min: 5.0000, Avg: 14.9688, Rolling: 14.9425 <0-02:11:12> 
+Ep: 0-305, Best score: 27.0000, Min: 3.0000, Avg: 15.4219, Rolling: 14.9450 <0-02:11:53> 
+Ep: 0-304, Best score: 26.0000, Min: 5.0000, Avg: 14.7344, Rolling: 14.9439 <0-02:12:32> 
+Ep: 0-303, Best score: 29.0000, Min: 2.0000, Avg: 15.0000, Rolling: 14.9442 <0-02:13:14> 
+Ep: 0-302, Best score: 28.0000, Min: 3.0000, Avg: 15.0469, Rolling: 14.9447 <0-02:13:55> 
+Ep: 0-301, Best score: 32.0000, Min: 4.0000, Avg: 15.5156, Rolling: 14.9476 <0-02:14:36> 
+Ep: 0-300, Best score: 30.0000, Min: 6.0000, Avg: 15.9844, Rolling: 14.9527 <0-02:15:20> 
+Ep: 0-299, Best score: 26.0000, Min: 4.0000, Avg: 14.6406, Rolling: 14.9512 <0-02:16:01> 
+Ep: 0-298, Best score: 30.0000, Min: 4.0000, Avg: 14.7500, Rolling: 14.9502 <0-02:16:43> 
+Ep: 0-297, Best score: 26.0000, Min: 4.0000, Avg: 14.7656, Rolling: 14.9493 <0-02:17:23> 
+Ep: 0-296, Best score: 32.0000, Min: 4.0000, Avg: 14.5156, Rolling: 14.9472 <0-02:18:05> 
+Ep: 0-295, Best score: 27.0000, Min: 4.0000, Avg: 16.0156, Rolling: 14.9524 <0-02:18:48> 
+Ep: 0-294, Best score: 26.0000, Min: 3.0000, Avg: 14.5312, Rolling: 14.9503 <0-02:19:27> 
+Ep: 0-293, Best score: 26.0000, Min: 5.0000, Avg: 14.9688, Rolling: 14.9504 <0-02:20:07> 
+Ep: 0-292, Best score: 28.0000, Min: 4.0000, Avg: 15.9219, Rolling: 14.9551 <0-02:20:49> 
+Ep: 0-291, Best score: 29.0000, Min: 3.0000, Avg: 15.4531, Rolling: 14.9575 <0-02:21:31> 
+Ep: 0-290, Best score: 27.0000, Min: 2.0000, Avg: 16.0156, Rolling: 14.9625 <0-02:22:13> 
+Ep: 0-289, Best score: 28.0000, Min: 5.0000, Avg: 15.9219, Rolling: 14.9670 <0-02:22:56> 
+Ep: 0-288, Best score: 26.0000, Min: 5.0000, Avg: 14.3438, Rolling: 14.9641 <0-02:23:36> 
+Ep: 0-287, Best score: 32.0000, Min: 4.0000, Avg: 15.1719, Rolling: 14.9651 <0-02:24:16> 
+Ep: 0-286, Best score: 31.0000, Min: 8.0000, Avg: 16.4375, Rolling: 14.9720 <0-02:24:59> 
+Ep: 0-285, Best score: 29.0000, Min: 6.0000, Avg: 16.3125, Rolling: 14.9782 <0-02:25:42> 
+Ep: 0-284, Best score: 28.0000, Min: 5.0000, Avg: 15.6719, Rolling: 14.9814 <0-02:26:26> 
+Ep: 0-283, Best score: 25.0000, Min: 2.0000, Avg: 13.7812, Rolling: 14.9759 <0-02:27:05> 
+Ep: 0-282, Best score: 32.0000, Min: 4.0000, Avg: 15.5156, Rolling: 14.9784 <0-02:27:45> 
+Ep: 0-281, Best score: 28.0000, Min: 3.0000, Avg: 15.0625, Rolling: 14.9787 <0-02:28:25> 
+Ep: 0-280, Best score: 29.0000, Min: 5.0000, Avg: 15.4688, Rolling: 14.9810 <0-02:29:08> 
+Ep: 0-279, Best score: 26.0000, Min: 4.0000, Avg: 14.8281, Rolling: 14.9803 <0-02:29:49> 
+Ep: 0-278, Best score: 28.0000, Min: 4.0000, Avg: 15.5469, Rolling: 14.9828 <0-02:30:30> 
+Ep: 0-277, Best score: 29.0000, Min: 6.0000, Avg: 15.2969, Rolling: 14.9842 <0-02:31:10> 
+Ep: 0-276, Best score: 30.0000, Min: 4.0000, Avg: 15.4062, Rolling: 14.9861 <0-02:31:52> 
+Ep: 0-275, Best score: 24.0000, Min: 3.0000, Avg: 14.6406, Rolling: 14.9846 <0-02:32:31> 
+Ep: 0-274, Best score: 27.0000, Min: 7.0000, Avg: 15.2969, Rolling: 14.9860 <0-02:33:12> 
+Ep: 0-273, Best score: 28.0000, Min: 5.0000, Avg: 16.5469, Rolling: 14.9928 <0-02:33:55> 
+Ep: 0-272, Best score: 31.0000, Min: 5.0000, Avg: 17.1250, Rolling: 15.0022 <0-02:34:41> 
+Ep: 0-271, Best score: 29.0000, Min: 3.0000, Avg: 14.5156, Rolling: 15.0001 <0-02:35:22> 
+Ep: 0-270, Best score: 27.0000, Min: 6.0000, Avg: 15.2188, Rolling: 15.0010 <0-02:36:03> 
+Ep: 0-269, Best score: 26.0000, Min: 5.0000, Avg: 16.1719, Rolling: 15.0061 <0-02:36:46> 
+Ep: 0-268, Best score: 29.0000, Min: 6.0000, Avg: 16.1719, Rolling: 15.0111 <0-02:37:29> 
+Ep: 0-267, Best score: 34.0000, Min: 5.0000, Avg: 16.0781, Rolling: 15.0157 <0-02:38:12> 
+Ep: 0-266, Best score: 30.0000, Min: 4.0000, Avg: 16.5312, Rolling: 15.0222 <0-02:38:56> 
+Ep: 0-265, Best score: 27.0000, Min: 3.0000, Avg: 14.3594, Rolling: 15.0193 <0-02:39:37> 
+Ep: 0-264, Best score: 25.0000, Min: 5.0000, Avg: 15.8750, Rolling: 15.0230 <0-02:40:18> 
+Ep: 0-263, Best score: 27.0000, Min: 3.0000, Avg: 15.3906, Rolling: 15.0245 <0-02:41:01> 
+Ep: 0-262, Best score: 32.0000, Min: 6.0000, Avg: 15.5469, Rolling: 15.0267 <0-02:41:44> 
+Ep: 0-261, Best score: 27.0000, Min: 2.0000, Avg: 14.2812, Rolling: 15.0236 <0-02:42:25> 
+Ep: 0-260, Best score: 30.0000, Min: 4.0000, Avg: 15.3906, Rolling: 15.0251 <0-02:43:11> 
+Ep: 0-259, Best score: 27.0000, Min: 6.0000, Avg: 15.2031, Rolling: 15.0259 <0-02:43:52> 
+Ep: 0-258, Best score: 27.0000, Min: 4.0000, Avg: 16.3125, Rolling: 15.0312 <0-02:44:36> 
+Ep: 0-257, Best score: 27.0000, Min: 3.0000, Avg: 14.8750, Rolling: 15.0305 <0-02:45:16> 
+Ep: 0-256, Best score: 33.0000, Min: 3.0000, Avg: 15.6406, Rolling: 15.0330 <0-02:45:58> 
+Ep: 0-255, Best score: 37.0000, Min: 6.0000, Avg: 15.7812, Rolling: 15.0361 <0-02:46:41> 
+Ep: 0-254, Best score: 26.0000, Min: 2.0000, Avg: 13.5000, Rolling: 15.0299 <0-02:47:18> 
+Ep: 0-253, Best score: 25.0000, Min: 4.0000, Avg: 15.1875, Rolling: 15.0305 <0-02:47:58> 
+Ep: 0-252, Best score: 29.0000, Min: 5.0000, Avg: 15.8906, Rolling: 15.0340 <0-02:48:42> 
+Ep: 0-251, Best score: 28.0000, Min: 3.0000, Avg: 15.0938, Rolling: 15.0342 <0-02:49:23> 
+Ep: 0-250, Best score: 27.0000, Min: 5.0000, Avg: 15.5938, Rolling: 15.0364 <0-02:50:05> 
+Ep: 0-249, Best score: 27.0000, Min: 5.0000, Avg: 15.9062, Rolling: 15.0399 <0-02:50:48> 
+Ep: 0-248, Best score: 27.0000, Min: 2.0000, Avg: 15.0000, Rolling: 15.0397 <0-02:51:29> 
+Ep: 0-247, Best score: 27.0000, Min: 2.0000, Avg: 15.5625, Rolling: 15.0418 <0-02:52:12> 
+Ep: 0-246, Best score: 32.0000, Min: 6.0000, Avg: 15.9688, Rolling: 15.0455 <0-02:52:55> 
+Ep: 0-245, Best score: 28.0000, Min: 5.0000, Avg: 15.5625, Rolling: 15.0475 <0-02:53:39> 
+Ep: 0-244, Best score: 29.0000, Min: 4.0000, Avg: 15.7500, Rolling: 15.0502 <0-02:54:23> 
+Ep: 0-243, Best score: 33.0000, Min: 3.0000, Avg: 15.6250, Rolling: 15.0525 <0-02:55:04> 
+Ep: 0-242, Best score: 28.0000, Min: 7.0000, Avg: 15.5469, Rolling: 15.0544 <0-02:55:46> 
+Ep: 0-241, Best score: 27.0000, Min: 2.0000, Avg: 14.9375, Rolling: 15.0539 <0-02:56:27> 
+Ep: 0-240, Best score: 30.0000, Min: 4.0000, Avg: 16.3438, Rolling: 15.0589 <0-02:57:11> 
+Ep: 0-239, Best score: 28.0000, Min: 2.0000, Avg: 16.4062, Rolling: 15.0641 <0-02:57:55> 
+Ep: 0-238, Best score: 31.0000, Min: 4.0000, Avg: 15.9219, Rolling: 15.0673 <0-02:58:39> 
+Ep: 0-237, Best score: 39.0000, Min: 6.0000, Avg: 16.3281, Rolling: 15.0721 <0-02:59:23> 
+Ep: 0-236, Best score: 27.0000, Min: 4.0000, Avg: 15.0781, Rolling: 15.0721 <0-03:00:03> 
+Ep: 0-235, Best score: 27.0000, Min: 5.0000, Avg: 15.3438, Rolling: 15.0732 <0-03:00:44> 
+Ep: 0-234, Best score: 24.0000, Min: 4.0000, Avg: 15.7656, Rolling: 15.0758 <0-03:01:27> 
+Ep: 0-233, Best score: 31.0000, Min: 4.0000, Avg: 16.7344, Rolling: 15.0820 <0-03:02:11> 
+Ep: 0-232, Best score: 26.0000, Min: 4.0000, Avg: 15.7344, Rolling: 15.0844 <0-03:02:54> 
+Ep: 0-231, Best score: 29.0000, Min: 5.0000, Avg: 17.2656, Rolling: 15.0925 <0-03:03:40> 
+Ep: 0-230, Best score: 27.0000, Min: 4.0000, Avg: 15.3594, Rolling: 15.0935 <0-03:04:21> 
+Ep: 0-229, Best score: 28.0000, Min: 6.0000, Avg: 15.6719, Rolling: 15.0957 <0-03:05:04> 
+Ep: 0-228, Best score: 30.0000, Min: 5.0000, Avg: 15.6250, Rolling: 15.0976 <0-03:05:49> 
+Ep: 0-227, Best score: 36.0000, Min: 3.0000, Avg: 15.8906, Rolling: 15.1005 <0-03:06:34> 
+Ep: 0-226, Best score: 30.0000, Min: 4.0000, Avg: 15.0625, Rolling: 15.1004 <0-03:07:15> 
+Ep: 0-225, Best score: 28.0000, Min: 3.0000, Avg: 14.4844, Rolling: 15.0981 <0-03:07:56> 
+Ep: 0-224, Best score: 28.0000, Min: 3.0000, Avg: 15.6719, Rolling: 15.1002 <0-03:08:38> 
+Ep: 0-223, Best score: 26.0000, Min: 4.0000, Avg: 15.1875, Rolling: 15.1005 <0-03:09:21> 
+Ep: 0-222, Best score: 33.0000, Min: 3.0000, Avg: 15.8125, Rolling: 15.1031 <0-03:10:05> 
+Ep: 0-221, Best score: 28.0000, Min: 3.0000, Avg: 15.5000, Rolling: 15.1045 <0-03:10:46> 
+Ep: 0-220, Best score: 29.0000, Min: 2.0000, Avg: 14.9531, Rolling: 15.1040 <0-03:11:28> 
+Ep: 0-219, Best score: 31.0000, Min: 4.0000, Avg: 15.5625, Rolling: 15.1056 <0-03:12:08> 
+Ep: 0-218, Best score: 31.0000, Min: 4.0000, Avg: 15.9844, Rolling: 15.1087 <0-03:12:50> 
+Ep: 0-217, Best score: 28.0000, Min: 3.0000, Avg: 14.3281, Rolling: 15.1060 <0-03:13:30> 
+Ep: 0-216, Best score: 28.0000, Min: 5.0000, Avg: 16.2031, Rolling: 15.1098 <0-03:14:14> 
+Ep: 0-215, Best score: 30.0000, Min: 5.0000, Avg: 15.2031, Rolling: 15.1101 <0-03:14:55> 
+Ep: 0-214, Best score: 26.0000, Min: 5.0000, Avg: 15.2031, Rolling: 15.1105 <0-03:15:35> 
+Ep: 0-213, Best score: 26.0000, Min: 5.0000, Avg: 16.3125, Rolling: 15.1147 <0-03:16:18> 
+Ep: 0-212, Best score: 30.0000, Min: 4.0000, Avg: 16.7812, Rolling: 15.1204 <0-03:17:03> 
+Ep: 0-211, Best score: 30.0000, Min: 4.0000, Avg: 14.4688, Rolling: 15.1182 <0-03:17:43> 
+Ep: 0-210, Best score: 27.0000, Min: 5.0000, Avg: 14.8750, Rolling: 15.1173 <0-03:18:24> 
+Ep: 0-209, Best score: 38.0000, Min: 6.0000, Avg: 16.7188, Rolling: 15.1229 <0-03:19:08> 
+Ep: 0-208, Best score: 29.0000, Min: 4.0000, Avg: 14.9531, Rolling: 15.1223 <0-03:19:50> 
+Ep: 0-207, Best score: 28.0000, Min: 6.0000, Avg: 15.7812, Rolling: 15.1245 <0-03:20:32> 
+Ep: 0-206, Best score: 26.0000, Min: 5.0000, Avg: 15.8438, Rolling: 15.1270 <0-03:21:14> 
+Ep: 0-205, Best score: 28.0000, Min: 7.0000, Avg: 16.8281, Rolling: 15.1327 <0-03:21:58> 
+Ep: 0-204, Best score: 28.0000, Min: 2.0000, Avg: 15.3594, Rolling: 15.1335 <0-03:22:41> 
+Ep: 0-203, Best score: 27.0000, Min: 5.0000, Avg: 15.5156, Rolling: 15.1348 <0-03:23:22> 
+Ep: 0-202, Best score: 32.0000, Min: 5.0000, Avg: 16.0469, Rolling: 15.1378 <0-03:24:05> 
+Ep: 0-201, Best score: 35.0000, Min: 3.0000, Avg: 14.6406, Rolling: 15.1362 <0-03:24:46> 
+Ep: 0-200, Best score: 29.0000, Min: 3.0000, Avg: 16.6875, Rolling: 15.1414 <0-03:25:30> 
+Ep: 0-199, Best score: 26.0000, Min: 5.0000, Avg: 15.1562, Rolling: 15.1414 <0-03:26:12> 
+Ep: 0-198, Best score: 28.0000, Min: 4.0000, Avg: 15.9375, Rolling: 15.1440 <0-03:26:55> 
+Ep: 0-197, Best score: 25.0000, Min: 4.0000, Avg: 13.6875, Rolling: 15.1392 <0-03:27:33> 
+Ep: 0-196, Best score: 30.0000, Min: 3.0000, Avg: 15.7500, Rolling: 15.1412 <0-03:28:16> 
+Ep: 0-195, Best score: 28.0000, Min: 5.0000, Avg: 14.5156, Rolling: 15.1392 <0-03:28:56> 
+Ep: 0-194, Best score: 28.0000, Min: 5.0000, Avg: 16.1719, Rolling: 15.1426 <0-03:29:41> 
+Ep: 0-193, Best score: 31.0000, Min: 5.0000, Avg: 15.1250, Rolling: 15.1425 <0-03:30:23> 
+Ep: 0-192, Best score: 28.0000, Min: 6.0000, Avg: 15.1250, Rolling: 15.1425 <0-03:31:04> 
+Ep: 0-191, Best score: 30.0000, Min: 5.0000, Avg: 15.2969, Rolling: 15.1430 <0-03:31:46> 
+Ep: 0-190, Best score: 30.0000, Min: 4.0000, Avg: 14.8438, Rolling: 15.1420 <0-03:32:28> 
+Ep: 0-189, Best score: 31.0000, Min: 3.0000, Avg: 16.0938, Rolling: 15.1450 <0-03:33:13> 
+Ep: 0-188, Best score: 29.0000, Min: 4.0000, Avg: 15.7969, Rolling: 15.1471 <0-03:33:56> 
+Ep: 0-187, Best score: 27.0000, Min: 4.0000, Avg: 14.4219, Rolling: 15.1448 <0-03:34:36> 
+Ep: 0-186, Best score: 30.0000, Min: 5.0000, Avg: 16.6406, Rolling: 15.1496 <0-03:35:19> 
+Ep: 0-185, Best score: 28.0000, Min: 5.0000, Avg: 16.4688, Rolling: 15.1538 <0-03:36:02> 
+Ep: 0-184, Best score: 31.0000, Min: 5.0000, Avg: 16.8125, Rolling: 15.1590 <0-03:36:48> 
+Ep: 0-183, Best score: 29.0000, Min: 4.0000, Avg: 14.3594, Rolling: 15.1565 <0-03:37:29> 
+Ep: 0-182, Best score: 26.0000, Min: 4.0000, Avg: 16.1719, Rolling: 15.1597 <0-03:38:11> 
+Ep: 0-181, Best score: 32.0000, Min: 2.0000, Avg: 15.0625, Rolling: 15.1594 <0-03:38:53> 
+Ep: 0-180, Best score: 26.0000, Min: 6.0000, Avg: 15.8750, Rolling: 15.1616 <0-03:39:36> 
+Ep: 0-179, Best score: 25.0000, Min: 4.0000, Avg: 16.0469, Rolling: 15.1644 <0-03:40:19> 
+Ep: 0-178, Best score: 32.0000, Min: 5.0000, Avg: 15.7656, Rolling: 15.1662 <0-03:41:02> 
+Ep: 0-177, Best score: 31.0000, Min: 5.0000, Avg: 15.8125, Rolling: 15.1682 <0-03:41:46> 
+Ep: 0-176, Best score: 28.0000, Min: 5.0000, Avg: 15.2188, Rolling: 15.1684 <0-03:42:25> 
+Ep: 0-175, Best score: 27.0000, Min: 5.0000, Avg: 16.2031, Rolling: 15.1716 <0-03:43:08> 
+Ep: 0-174, Best score: 29.0000, Min: 5.0000, Avg: 14.3125, Rolling: 15.1690 <0-03:43:48> 
+Ep: 0-173, Best score: 28.0000, Min: 7.0000, Avg: 16.6406, Rolling: 15.1735 <0-03:44:31> 
+Ep: 0-172, Best score: 31.0000, Min: 6.0000, Avg: 15.5625, Rolling: 15.1746 <0-03:45:13> 
+Ep: 0-171, Best score: 25.0000, Min: 5.0000, Avg: 16.0781, Rolling: 15.1774 <0-03:45:55> 
+Ep: 0-170, Best score: 26.0000, Min: 6.0000, Avg: 15.6875, Rolling: 15.1789 <0-03:46:35> 
+Ep: 0-169, Best score: 25.0000, Min: 5.0000, Avg: 15.7344, Rolling: 15.1806 <0-03:47:16> 
+Ep: 0-168, Best score: 30.0000, Min: 6.0000, Avg: 16.1719, Rolling: 15.1836 <0-03:47:59> 
+Ep: 0-167, Best score: 28.0000, Min: 4.0000, Avg: 15.3438, Rolling: 15.1841 <0-03:48:39> 
+Ep: 0-166, Best score: 26.0000, Min: 4.0000, Avg: 15.2500, Rolling: 15.1843 <0-03:49:21> 
+Ep: 0-165, Best score: 30.0000, Min: 7.0000, Avg: 15.9531, Rolling: 15.1866 <0-03:50:04> 
+Ep: 0-164, Best score: 30.0000, Min: 7.0000, Avg: 16.4531, Rolling: 15.1903 <0-03:50:48> 
+Ep: 0-163, Best score: 25.0000, Min: 4.0000, Avg: 14.7344, Rolling: 15.1890 <0-03:51:29> 
+Ep: 0-162, Best score: 30.0000, Min: 2.0000, Avg: 15.1250, Rolling: 15.1888 <0-03:52:10> 
+Ep: 0-161, Best score: 27.0000, Min: 7.0000, Avg: 15.4844, Rolling: 15.1897 <0-03:52:51> 
+Ep: 0-160, Best score: 28.0000, Min: 6.0000, Avg: 15.5000, Rolling: 15.1906 <0-03:53:33> 
+Ep: 0-159, Best score: 28.0000, Min: 6.0000, Avg: 16.8125, Rolling: 15.1953 <0-03:54:17> 
+Ep: 0-158, Best score: 34.0000, Min: 3.0000, Avg: 16.9844, Rolling: 15.2006 <0-03:55:04> 
+Ep: 0-157, Best score: 31.0000, Min: 6.0000, Avg: 15.9219, Rolling: 15.2027 <0-03:55:47> 
+Ep: 0-156, Best score: 28.0000, Min: 7.0000, Avg: 15.3438, Rolling: 15.2031 <0-03:56:28> 
+Ep: 0-155, Best score: 31.0000, Min: 4.0000, Avg: 15.0938, Rolling: 15.2028 <0-03:57:08> 
+Ep: 0-154, Best score: 26.0000, Min: 7.0000, Avg: 15.8594, Rolling: 15.2047 <0-03:57:50> 
+Ep: 0-153, Best score: 29.0000, Min: 7.0000, Avg: 15.5781, Rolling: 15.2057 <0-03:58:32> 
+Ep: 0-152, Best score: 29.0000, Min: 5.0000, Avg: 15.6250, Rolling: 15.2069 <0-03:59:15> 
+Ep: 0-151, Best score: 29.0000, Min: 6.0000, Avg: 16.0000, Rolling: 15.2092 <0-03:59:59> 
+Ep: 0-150, Best score: 27.0000, Min: 3.0000, Avg: 16.2812, Rolling: 15.2123 <0-04:00:42> 
+Ep: 0-149, Best score: 25.0000, Min: 5.0000, Avg: 15.6562, Rolling: 15.2135 <0-04:01:24> 
+Ep: 0-148, Best score: 36.0000, Min: 7.0000, Avg: 16.7969, Rolling: 15.2180 <0-04:02:09> 
+Ep: 0-147, Best score: 26.0000, Min: 6.0000, Avg: 14.7031, Rolling: 15.2166 <0-04:02:49> 
+Ep: 0-146, Best score: 30.0000, Min: 6.0000, Avg: 15.4844, Rolling: 15.2173 <0-04:03:29> 
+Ep: 0-145, Best score: 26.0000, Min: 5.0000, Avg: 16.5312, Rolling: 15.2210 <0-04:04:13> 
+Ep: 0-144, Best score: 31.0000, Min: 3.0000, Avg: 16.4688, Rolling: 15.2245 <0-04:04:58> 
+Ep: 0-143, Best score: 29.0000, Min: 5.0000, Avg: 17.3438, Rolling: 15.2305 <0-04:05:45> 
+Ep: 0-142, Best score: 29.0000, Min: 6.0000, Avg: 15.8125, Rolling: 15.2321 <0-04:06:28> 
+Ep: 0-141, Best score: 26.0000, Min: 6.0000, Avg: 15.1250, Rolling: 15.2318 <0-04:07:10> 
+Ep: 0-140, Best score: 31.0000, Min: 7.0000, Avg: 16.2969, Rolling: 15.2348 <0-04:07:52> 
+Ep: 0-139, Best score: 29.0000, Min: 4.0000, Avg: 16.2500, Rolling: 15.2376 <0-04:08:36> 
+Ep: 0-138, Best score: 27.0000, Min: 4.0000, Avg: 16.5000, Rolling: 15.2411 <0-04:09:20> 
+Ep: 0-137, Best score: 29.0000, Min: 7.0000, Avg: 16.5781, Rolling: 15.2447 <0-04:10:04> 
+Ep: 0-136, Best score: 32.0000, Min: 3.0000, Avg: 16.6719, Rolling: 15.2487 <0-04:10:50> 
+Ep: 0-135, Best score: 35.0000, Min: 6.0000, Avg: 17.5469, Rolling: 15.2550 <0-04:11:37> 
+Ep: 0-134, Best score: 26.0000, Min: 5.0000, Avg: 15.5625, Rolling: 15.2558 <0-04:12:19> 
+Ep: 0-133, Best score: 30.0000, Min: 4.0000, Avg: 15.2500, Rolling: 15.2558 <0-04:13:01> 
+Ep: 0-132, Best score: 26.0000, Min: 6.0000, Avg: 15.9062, Rolling: 15.2576 <0-04:13:43> 
+Ep: 0-131, Best score: 32.0000, Min: 7.0000, Avg: 16.0469, Rolling: 15.2597 <0-04:14:26> 
+Ep: 0-130, Best score: 25.0000, Min: 5.0000, Avg: 16.6094, Rolling: 15.2633 <0-04:15:10> 
+Ep: 0-129, Best score: 26.0000, Min: 3.0000, Avg: 14.8750, Rolling: 15.2623 <0-04:15:49> 
+Ep: 0-128, Best score: 33.0000, Min: 5.0000, Avg: 15.9062, Rolling: 15.2640 <0-04:16:32> 
+Ep: 0-127, Best score: 27.0000, Min: 6.0000, Avg: 16.4688, Rolling: 15.2673 <0-04:17:17> 
+Ep: 0-126, Best score: 27.0000, Min: 8.0000, Avg: 15.7031, Rolling: 15.2684 <0-04:17:57> 
+Ep: 0-125, Best score: 30.0000, Min: 5.0000, Avg: 15.0781, Rolling: 15.2679 <0-04:18:36> 
+Ep: 0-124, Best score: 24.0000, Min: 8.0000, Avg: 15.7344, Rolling: 15.2692 <0-04:19:19> 
+Ep: 0-123, Best score: 31.0000, Min: 5.0000, Avg: 16.5781, Rolling: 15.2726 <0-04:20:03> 
+Ep: 0-122, Best score: 25.0000, Min: 7.0000, Avg: 16.2500, Rolling: 15.2752 <0-04:20:46> 
+Ep: 0-121, Best score: 31.0000, Min: 5.0000, Avg: 14.8594, Rolling: 15.2741 <0-04:21:24> 
+Ep: 0-120, Best score: 28.0000, Min: 4.0000, Avg: 15.2031, Rolling: 15.2739 <0-04:22:05> 
+Ep: 0-119, Best score: 31.0000, Min: 6.0000, Avg: 16.2188, Rolling: 15.2764 <0-04:22:48> 
+Ep: 0-118, Best score: 33.0000, Min: 5.0000, Avg: 15.8594, Rolling: 15.2779 <0-04:23:31> 
+Ep: 0-117, Best score: 26.0000, Min: 4.0000, Avg: 15.6719, Rolling: 15.2790 <0-04:24:12> 
+Ep: 0-116, Best score: 28.0000, Min: 3.0000, Avg: 14.4531, Rolling: 15.2768 <0-04:24:54> 
+Ep: 0-115, Best score: 29.0000, Min: 5.0000, Avg: 15.2812, Rolling: 15.2768 <0-04:25:35> 
+Ep: 0-114, Best score: 35.0000, Min: 6.0000, Avg: 16.3438, Rolling: 15.2796 <0-04:26:19> 
+Ep: 0-113, Best score: 32.0000, Min: 3.0000, Avg: 16.5781, Rolling: 15.2829 <0-04:27:03> 
+Ep: 0-112, Best score: 28.0000, Min: 2.0000, Avg: 15.7188, Rolling: 15.2841 <0-04:27:47> 
+Ep: 0-111, Best score: 26.0000, Min: 4.0000, Avg: 15.7500, Rolling: 15.2853 <0-04:28:30> 
+Ep: 0-110, Best score: 29.0000, Min: 3.0000, Avg: 15.7031, Rolling: 15.2863 <0-04:29:11> 
+Ep: 0-109, Best score: 38.0000, Min: 3.0000, Avg: 15.3281, Rolling: 15.2864 <0-04:29:54> 
+Ep: 0-108, Best score: 32.0000, Min: 5.0000, Avg: 17.0156, Rolling: 15.2909 <0-04:30:41> 
+Ep: 0-107, Best score: 26.0000, Min: 6.0000, Avg: 15.8438, Rolling: 15.2923 <0-04:31:23> 
+Ep: 0-106, Best score: 30.0000, Min: 5.0000, Avg: 16.2188, Rolling: 15.2946 <0-04:32:07> 
+Ep: 0-105, Best score: 32.0000, Min: 5.0000, Avg: 16.3594, Rolling: 15.2973 <0-04:32:51> 
+Ep: 0-104, Best score: 29.0000, Min: 8.0000, Avg: 16.2969, Rolling: 15.2998 <0-04:33:34> 
+Ep: 0-103, Best score: 32.0000, Min: 4.0000, Avg: 15.2031, Rolling: 15.2996 <0-04:34:15> 
+Ep: 0-102, Best score: 25.0000, Min: 8.0000, Avg: 16.7656, Rolling: 15.3033 <0-04:34:58> 
+Ep: 0-101, Best score: 34.0000, Min: 4.0000, Avg: 16.5312, Rolling: 15.3064 <0-04:35:43> 
+Ep: 0-100, Best score: 33.0000, Min: 2.0000, Avg: 17.0312, Rolling: 15.3107 <0-04:36:28> 
+Ep: 0-99, Best score: 26.0000, Min: 4.0000, Avg: 14.5312, Rolling: 15.3087 <0-04:37:07> 
+Ep: 0-98, Best score: 29.0000, Min: 6.0000, Avg: 16.3750, Rolling: 15.3114 <0-04:37:50> 
+Ep: 0-97, Best score: 34.0000, Min: 6.0000, Avg: 16.2656, Rolling: 15.3137 <0-04:38:33> 
+Ep: 0-96, Best score: 34.0000, Min: 5.0000, Avg: 15.7656, Rolling: 15.3149 <0-04:39:18> 
+Ep: 0-95, Best score: 31.0000, Min: 5.0000, Avg: 15.8594, Rolling: 15.3162 <0-04:40:01> 
+Ep: 0-94, Best score: 25.0000, Min: 5.0000, Avg: 15.5469, Rolling: 15.3168 <0-04:40:44> 
+Ep: 0-93, Best score: 29.0000, Min: 4.0000, Avg: 15.2500, Rolling: 15.3166 <0-04:41:25> 
+Ep: 0-92, Best score: 24.0000, Min: 5.0000, Avg: 15.5469, Rolling: 15.3172 <0-04:42:08> 
+Ep: 0-91, Best score: 28.0000, Min: 3.0000, Avg: 15.5938, Rolling: 15.3178 <0-04:42:50> 
+Ep: 0-90, Best score: 27.0000, Min: 5.0000, Avg: 14.7500, Rolling: 15.3165 <0-04:43:30> 
+Ep: 0-89, Best score: 27.0000, Min: 8.0000, Avg: 15.7656, Rolling: 15.3176 <0-04:44:12> 
+Ep: 0-88, Best score: 27.0000, Min: 4.0000, Avg: 14.7812, Rolling: 15.3163 <0-04:44:53> 
+Ep: 0-87, Best score: 32.0000, Min: 5.0000, Avg: 15.5000, Rolling: 15.3167 <0-04:45:36> 
+Ep: 0-86, Best score: 29.0000, Min: 6.0000, Avg: 16.2188, Rolling: 15.3189 <0-04:46:19> 
+Ep: 0-85, Best score: 27.0000, Min: 6.0000, Avg: 16.2812, Rolling: 15.3212 <0-04:47:02> 
+Ep: 0-84, Best score: 32.0000, Min: 3.0000, Avg: 15.3906, Rolling: 15.3214 <0-04:47:44> 
+Ep: 0-83, Best score: 26.0000, Min: 5.0000, Avg: 15.6875, Rolling: 15.3222 <0-04:48:27> 
+Ep: 0-82, Best score: 30.0000, Min: 6.0000, Avg: 15.8750, Rolling: 15.3236 <0-04:49:08> 
+Ep: 0-81, Best score: 27.0000, Min: 3.0000, Avg: 14.9844, Rolling: 15.3228 <0-04:49:48> 
+Ep: 0-80, Best score: 28.0000, Min: 5.0000, Avg: 16.0156, Rolling: 15.3244 <0-04:50:33> 
+Ep: 0-79, Best score: 27.0000, Min: 5.0000, Avg: 14.8906, Rolling: 15.3234 <0-04:51:15> 
+Ep: 0-78, Best score: 29.0000, Min: 5.0000, Avg: 16.9375, Rolling: 15.3272 <0-04:52:03> 
+Ep: 0-77, Best score: 31.0000, Min: 2.0000, Avg: 15.8438, Rolling: 15.3284 <0-04:52:49> 
+Ep: 0-76, Best score: 30.0000, Min: 4.0000, Avg: 14.6094, Rolling: 15.3267 <0-04:53:33> 
+Ep: 0-75, Best score: 26.0000, Min: 6.0000, Avg: 15.9375, Rolling: 15.3282 <0-04:54:18> 
+Ep: 0-74, Best score: 27.0000, Min: 5.0000, Avg: 14.7969, Rolling: 15.3269 <0-04:55:02> 
+Ep: 0-73, Best score: 32.0000, Min: 7.0000, Avg: 17.0000, Rolling: 15.3308 <0-04:55:53> 
+Ep: 0-72, Best score: 31.0000, Min: 5.0000, Avg: 16.0000, Rolling: 15.3324 <0-04:56:36> 
+Ep: 0-71, Best score: 30.0000, Min: 3.0000, Avg: 14.5781, Rolling: 15.3306 <0-04:57:16> 
+Ep: 0-70, Best score: 29.0000, Min: 5.0000, Avg: 16.3594, Rolling: 15.3330 <0-04:58:01> 
+Ep: 0-69, Best score: 29.0000, Min: 3.0000, Avg: 15.0781, Rolling: 15.3324 <0-04:58:42> 
+Ep: 0-68, Best score: 27.0000, Min: 5.0000, Avg: 15.9375, Rolling: 15.3338 <0-04:59:25> 
+Ep: 0-67, Best score: 27.0000, Min: 7.0000, Avg: 16.1250, Rolling: 15.3357 <0-05:00:11> 
+Ep: 0-66, Best score: 27.0000, Min: 2.0000, Avg: 14.9219, Rolling: 15.3347 <0-05:00:53> 
+Ep: 0-65, Best score: 32.0000, Min: 2.0000, Avg: 15.5781, Rolling: 15.3353 <0-05:01:38> 
+Ep: 0-64, Best score: 29.0000, Min: 6.0000, Avg: 15.6406, Rolling: 15.3360 <0-05:02:24> 
+Ep: 0-63, Best score: 31.0000, Min: 2.0000, Avg: 15.4688, Rolling: 15.3363 <0-05:03:07> 
+Ep: 0-62, Best score: 29.0000, Min: 2.0000, Avg: 14.6250, Rolling: 15.3347 <0-05:03:52> 
+Ep: 0-61, Best score: 27.0000, Min: 5.0000, Avg: 14.5312, Rolling: 15.3328 <0-05:04:36> 
+Ep: 0-60, Best score: 28.0000, Min: 4.0000, Avg: 15.3594, Rolling: 15.3329 <0-05:05:19> 
+Ep: 0-59, Best score: 30.0000, Min: 4.0000, Avg: 16.2812, Rolling: 15.3350 <0-05:06:07> 
+Ep: 0-58, Best score: 29.0000, Min: 6.0000, Avg: 15.8906, Rolling: 15.3363 <0-05:06:51> 
+Ep: 0-57, Best score: 28.0000, Min: 2.0000, Avg: 15.7812, Rolling: 15.3373 <0-05:07:36> 
+Ep: 0-56, Best score: 30.0000, Min: 2.0000, Avg: 15.8281, Rolling: 15.3384 <0-05:08:23> 
+Ep: 0-55, Best score: 33.0000, Min: 5.0000, Avg: 15.6562, Rolling: 15.3391 <0-05:09:10> 
+Ep: 0-54, Best score: 30.0000, Min: 6.0000, Avg: 16.0312, Rolling: 15.3407 <0-05:09:59> 
+Ep: 0-53, Best score: 28.0000, Min: 4.0000, Avg: 15.9219, Rolling: 15.3420 <0-05:10:46> 
+Ep: 0-52, Best score: 25.0000, Min: 4.0000, Avg: 15.1875, Rolling: 15.3416 <0-05:11:31> 
+Ep: 0-51, Best score: 27.0000, Min: 5.0000, Avg: 15.1250, Rolling: 15.3411 <0-05:12:15> 
+Ep: 0-50, Best score: 33.0000, Min: 2.0000, Avg: 16.3125, Rolling: 15.3433 <0-05:13:04> 
+Ep: 0-49, Best score: 25.0000, Min: 4.0000, Avg: 14.5625, Rolling: 15.3416 <0-05:13:46> 
+Ep: 0-48, Best score: 27.0000, Min: 5.0000, Avg: 16.9375, Rolling: 15.3451 <0-05:14:34> 
+Ep: 0-47, Best score: 24.0000, Min: 5.0000, Avg: 14.6875, Rolling: 15.3436 <0-05:15:18> 
+Ep: 0-46, Best score: 29.0000, Min: 5.0000, Avg: 15.3281, Rolling: 15.3436 <0-05:16:02> 
+Ep: 0-45, Best score: 33.0000, Min: 3.0000, Avg: 16.2344, Rolling: 15.3456 <0-05:16:51> 
+Ep: 0-44, Best score: 28.0000, Min: 8.0000, Avg: 16.0625, Rolling: 15.3471 <0-05:17:37> 
+Ep: 0-43, Best score: 27.0000, Min: 3.0000, Avg: 15.9375, Rolling: 15.3484 <0-05:18:23> 
+Ep: 0-42, Best score: 28.0000, Min: 6.0000, Avg: 15.4531, Rolling: 15.3487 <0-05:19:07> 
+Ep: 0-41, Best score: 32.0000, Min: 5.0000, Avg: 15.2812, Rolling: 15.3485 <0-05:19:52> 
+Ep: 0-40, Best score: 26.0000, Min: 5.0000, Avg: 15.8906, Rolling: 15.3497 <0-05:20:39> 
+Ep: 0-39, Best score: 28.0000, Min: 5.0000, Avg: 16.1875, Rolling: 15.3515 <0-05:21:24> 
+Ep: 0-38, Best score: 28.0000, Min: 4.0000, Avg: 15.6875, Rolling: 15.3522 <0-05:22:07> 
+Ep: 0-37, Best score: 33.0000, Min: 5.0000, Avg: 16.3438, Rolling: 15.3544 <0-05:22:55> 
+Ep: 0-36, Best score: 28.0000, Min: 5.0000, Avg: 15.9219, Rolling: 15.3556 <0-05:23:40> 
+Ep: 0-35, Best score: 25.0000, Min: 7.0000, Avg: 15.9219, Rolling: 15.3568 <0-05:24:26> 
+Ep: 0-34, Best score: 38.0000, Min: 7.0000, Avg: 16.7500, Rolling: 15.3598 <0-05:25:17> 
+Ep: 0-33, Best score: 27.0000, Min: 5.0000, Avg: 15.1719, Rolling: 15.3594 <0-05:26:01> 
+Ep: 0-32, Best score: 29.0000, Min: 7.0000, Avg: 15.5625, Rolling: 15.3598 <0-05:26:45> 
+Ep: 0-31, Best score: 27.0000, Min: 4.0000, Avg: 13.8438, Rolling: 15.3566 <0-05:27:25> 
+Ep: 0-30, Best score: 25.0000, Min: 5.0000, Avg: 15.7500, Rolling: 15.3574 <0-05:28:10> 
+Ep: 0-29, Best score: 32.0000, Min: 4.0000, Avg: 15.7969, Rolling: 15.3584 <0-05:28:59> 
+Ep: 0-28, Best score: 31.0000, Min: 2.0000, Avg: 15.8438, Rolling: 15.3594 <0-05:29:46> 
+Ep: 0-27, Best score: 25.0000, Min: 4.0000, Avg: 14.9062, Rolling: 15.3585 <0-05:30:29> 
+Ep: 0-26, Best score: 31.0000, Min: 5.0000, Avg: 15.4062, Rolling: 15.3586 <0-05:31:15> 
+Ep: 0-25, Best score: 31.0000, Min: 5.0000, Avg: 16.2188, Rolling: 15.3604 <0-05:32:05> 
+Ep: 0-24, Best score: 25.0000, Min: 7.0000, Avg: 15.4375, Rolling: 15.3605 <0-05:32:48> 
+Ep: 0-23, Best score: 27.0000, Min: 8.0000, Avg: 16.3281, Rolling: 15.3626 <0-05:33:35> 
+Ep: 0-22, Best score: 28.0000, Min: 5.0000, Avg: 15.6562, Rolling: 15.3632 <0-05:34:22> 
+Ep: 0-21, Best score: 30.0000, Min: 5.0000, Avg: 16.2188, Rolling: 15.3650 <0-05:35:09> 
+Ep: 0-20, Best score: 29.0000, Min: 6.0000, Avg: 15.2656, Rolling: 15.3647 <0-05:35:55> 
+Ep: 0-19, Best score: 29.0000, Min: 5.0000, Avg: 15.7812, Rolling: 15.3656 <0-05:36:41> 
+Ep: 0-18, Best score: 29.0000, Min: 4.0000, Avg: 16.3125, Rolling: 15.3676 <0-05:37:29> 
+Ep: 0-17, Best score: 28.0000, Min: 5.0000, Avg: 16.6875, Rolling: 15.3703 <0-05:38:17> 
+Ep: 0-16, Best score: 28.0000, Min: 4.0000, Avg: 15.5312, Rolling: 15.3706 <0-05:39:02> 
+Ep: 0-15, Best score: 30.0000, Min: 3.0000, Avg: 15.8594, Rolling: 15.3716 <0-05:39:48> 
+Ep: 0-14, Best score: 34.0000, Min: 5.0000, Avg: 17.0000, Rolling: 15.3750 <0-05:40:38> 
+Ep: 0-13, Best score: 28.0000, Min: 5.0000, Avg: 15.3906, Rolling: 15.3750 <0-05:41:24> 
+Ep: 0-12, Best score: 29.0000, Min: 4.0000, Avg: 16.3906, Rolling: 15.3771 <0-05:42:13> 
+Ep: 0-11, Best score: 33.0000, Min: 4.0000, Avg: 15.7812, Rolling: 15.3779 <0-05:43:00> 
+Ep: 0-10, Best score: 30.0000, Min: 5.0000, Avg: 15.1562, Rolling: 15.3775 <0-05:43:46> 
+Ep: 0-9, Best score: 27.0000, Min: 3.0000, Avg: 14.7500, Rolling: 15.3762 <0-05:44:30> 
+Ep: 0-8, Best score: 36.0000, Min: 5.0000, Avg: 16.7188, Rolling: 15.3789 <0-05:45:23> 
+Ep: 0-7, Best score: 29.0000, Min: 5.0000, Avg: 16.2188, Rolling: 15.3806 <0-05:46:12> 
+Ep: 0-6, Best score: 28.0000, Min: 3.0000, Avg: 15.3750, Rolling: 15.3806 <0-05:46:59> 
+Ep: 0-5, Best score: 34.0000, Min: 4.0000, Avg: 14.7344, Rolling: 15.3793 <0-05:47:45> 
+Ep: 0-4, Best score: 26.0000, Min: 6.0000, Avg: 15.6562, Rolling: 15.3799 <0-05:48:33> 
+Ep: 0-3, Best score: 30.0000, Min: 4.0000, Avg: 15.9688, Rolling: 15.3811 <0-05:49:19> 
+Ep: 0-2, Best score: 28.0000, Min: 5.0000, Avg: 15.6562, Rolling: 15.3816 <0-05:50:04> 
+Ep: 0-1, Best score: 27.0000, Min: 3.0000, Avg: 13.7656, Rolling: 15.3784 <0-05:50:46> 
+Ep: 0-0, Best score: 26.0000, Min: 5.0000, Avg: 14.3281, Rolling: 15.3763 <0-05:51:28> 

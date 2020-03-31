@@ -1,0 +1,706 @@
+Model: <class 'models.singleagent.ddpg.DDPGAgent'>, Env: CarRacing-v0/iter1, Date: 25/03/2020 09:52:13
+CPU: 20 Core, 0.0GHz, 377.59 GB, Linux-4.14.167-llgrid-10ms-x86_64-with-debian-buster-sid
+GPU 0: Tesla V100-PCIE-32GB, 32.51 GB (Driver: 440.33.01)
+GPU 1: Tesla V100-PCIE-32GB, 32.51 GB (Driver: 440.33.01)
+Git URL: git@github.com:shawnmanuel000/WorldModelsForDeepRL.git
+Hash: 75217ee4675634f8777811ed51c7de0078811309
+Branch: master
+
+num_envs: 16,
+state_size: (96, 96, 3),
+action_size: (3,),
+action_space: Box(3,),
+envs: <class 'utils.envs.EnvManager'>,
+statemodel: <utils.wrappers.WorldModel object at 0x7ffadc121b38>,
+
+import torch
+import random
+import numpy as np
+from utils.rand import RandomAgent, PrioritizedReplayBuffer, ReplayBuffer
+from utils.network import PTACNetwork, PTACAgent, PTCritic, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, REPLAY_BATCH_SIZE, TARGET_UPDATE_RATE, NUM_STEPS, EPS_DECAY, EPS_MIN, gsoftmax, one_hot
+
+class DDPGActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.discrete = type(action_size) != tuple
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.action_sig = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, sample=True):
+		state = self.layer1(state).relu() 
+		state = self.layer2(state).relu() 
+		state = self.layer3(state).relu() 
+		action_mu = self.action_mu(state)
+		action_sig = self.action_sig(state).exp()
+		epsilon = torch.randn_like(action_sig)
+		action = action_mu + epsilon.mul(action_sig) if sample else action_mu
+		return action.tanh() if not self.discrete else gsoftmax(action)
+	
+class DDPGCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.net_state = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.net_action = torch.nn.Linear(action_size[-1], INPUT_LAYER)
+		self.net_layer1 = torch.nn.Linear(2*INPUT_LAYER, CRITIC_HIDDEN)
+		self.net_layer2 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.q_value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, action):
+		state = self.net_state(state).relu()
+		net_action = self.net_action(action).relu()
+		net_layer = torch.cat([state, net_action], dim=-1)
+		net_layer = self.net_layer1(net_layer).relu()
+		net_layer = self.net_layer2(net_layer).relu()
+		q_value = self.q_value(net_layer)
+		return q_value
+
+class DDPGNetwork(PTACNetwork):
+	def __init__(self, state_size, action_size, actor=DDPGActor, critic=DDPGCritic, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=None, name="ddpg"): 
+		self.discrete = type(action_size)!=tuple
+		super().__init__(state_size, action_size, actor, critic if not self.discrete else lambda s,a: PTCritic(s,a), lr=lr, tau=tau, gpu=gpu, load=load, name=name)
+
+	def get_action(self, state, use_target=False, grad=False, numpy=False, sample=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			actor = self.actor_local if not use_target else self.actor_target
+			return actor(state, sample).cpu().numpy() if numpy else actor(state, sample)
+
+	def get_q_value(self, state, action, use_target=False, grad=False, numpy=False, probs=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			critic = self.critic_local if not use_target else self.critic_target
+			q_value = critic(state) if self.discrete else critic(state, action)
+			q_value = q_value.gather(-1, action.argmax(-1, keepdim=True)) if self.discrete and not probs else q_value
+			return q_value.cpu().numpy() if numpy else q_value
+	
+	def optimize(self, states, actions, q_targets, importances=1.0):
+		actions = one_hot(actions) if self.actor_local.discrete else actions
+		q_values = self.get_q_value(states, actions, grad=True, probs=False)
+		critic_loss = (q_values - q_targets.detach()).pow(2)
+		self.step(self.critic_optimizer, critic_loss.mean())
+		self.soft_copy(self.critic_local, self.critic_target)
+
+		actor_action = self.actor_local(states)
+		q_actions = self.get_q_value(states, actor_action, grad=True, probs=True)
+		q_actions = (actor_action*q_actions).sum(-1) if self.discrete else q_actions
+		q_baseline = q_targets if self.discrete else q_values
+		actor_loss = -(q_actions - q_baseline.detach())
+		self.step(self.actor_optimizer, actor_loss.mean())
+		self.soft_copy(self.actor_local, self.actor_target)
+		
+class DDPGAgent(PTACAgent):
+	def __init__(self, state_size, action_size, decay=EPS_DECAY, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, DDPGNetwork, decay=decay, lr=lr, tau=tau, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True):
+		eps = self.eps if eps is None else eps
+		action_random = super().get_action(state, eps)
+		if self.discrete and random.random() < eps: return action_random
+		action_greedy = self.network.get_action(self.to_tensor(state), numpy=True, sample=sample)
+		action = np.clip((1-eps)*action_greedy + eps*action_random, -1, 1)
+		return action
+		
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, action, reward, done))
+		if np.any(done[0]) or len(self.buffer) >= self.update_freq:
+			states, actions, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+			self.buffer.clear()	
+			states = torch.cat([states, self.to_tensor(next_state).unsqueeze(0)], dim=0)
+			actions = torch.cat([actions, self.network.get_action(states[-1], use_target=True).unsqueeze(0)], dim=0)
+			values = self.network.get_q_value(states, actions, use_target=True)
+			targets = self.compute_gae(values[-1], rewards.unsqueeze(-1), dones.unsqueeze(-1), values[:-1])[0]
+			states, actions, targets = [x.view(x.size(0)*x.size(1), *x.size()[2:]).cpu().numpy() for x in (states[:-1], actions[:-1], targets)]
+			self.replay_buffer.extend(list(zip(states, actions, targets)), shuffle=False)	
+		if len(self.replay_buffer) > REPLAY_BATCH_SIZE:
+			states, actions, targets = self.replay_buffer.sample(REPLAY_BATCH_SIZE, dtype=self.to_tensor)[0]
+			self.network.optimize(states, actions, targets)
+			if np.any(done[0]): self.eps = max(self.eps * self.decay, EPS_MIN)
+
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+REPLAY_BATCH_SIZE = 32        	# How many experience tuples to sample from the buffer for each train step
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+SAVE_DIR = "./saved_models"
+
+import os
+import gym
+import torch
+import argparse
+import numpy as np
+from envs import make_env, all_envs, env_name
+from models import all_models, EPS_MIN
+from utils.rand import RandomAgent
+from utils.misc import Logger, rollout
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker
+from utils.wrappers import WorldACAgent
+from utils.multiprocess import set_rank_size
+
+TRIAL_AT = 1000
+SAVE_AT = 1
+
+def train(make_env, model, ports, steps, checkpoint=None, save_best=True, log=True, render=False, worldmodel=True):
+	envs = (EnvManager if len(ports)>0 else EnsembleEnv)(make_env, ports if ports else 4)
+	agent = WorldACAgent(envs.state_size, envs.action_size, model, envs.num_envs, load=checkpoint, gpu=True, worldmodel=worldmodel) 
+	logger = Logger(model, checkpoint, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs), statemodel=agent.state_model)
+	states = envs.reset(train=True)
+	total_rewards = []
+	for s in range(steps+1):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s%TRIAL_AT==0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.round(np.mean(rollouts, axis=-1), 3))
+			if checkpoint and len(total_rewards)%SAVE_AT==0: agent.save_model(checkpoint)
+			if checkpoint and save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(checkpoint, "best")
+			if log: logger.log(f"Step: {s:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {round(np.mean(total_rewards, axis=0),3)} ({agent.acagent.eps:.4f})")
+	envs.close()
+
+def trial(make_env, model, checkpoint=None, render=False):
+	envs = EnsembleEnv(make_env, 1)
+	agent = WorldACAgent(envs.state_size, envs.action_size, model, envs.num_envs, load=checkpoint, train=False, gpu=False, worldmodel=True)
+	print(f"Reward: {rollout(envs, agent, eps=EPS_MIN, render=render)}")
+	envs.close()
+
+def parse_args(all_envs, all_models):
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--env_name", type=str, default=env_name, choices=all_envs, help="Name of the environment to use. Allowed values are:\n"+', '.join(all_envs), metavar="env_name")
+	parser.add_argument("--model", type=str, default="ppo", choices=all_models, help="Which RL algorithm to use. Allowed values are:\n"+', '.join(all_models), metavar="model")
+	parser.add_argument("--iternum", type=int, default=-1, choices=[-1,0,1], help="Whether to train using World Model to load (0 or 1) or raw images (-1)")
+	parser.add_argument("--tcp_ports", type=int, default=[], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--tcp_rank", type=int, default=0, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--render", action="store_true", help="Whether to render an environment rollout")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run training on the Pendulum-v0 environment")
+	parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+	args = parser.parse_args()
+	return args
+
+if __name__ == "__main__":
+	args = parse_args(all_envs, all_models.keys())
+	checkpoint = f"{args.env_name}/pytorch" if args.iternum < 0 else f"{args.env_name}/iter{args.iternum}"
+	rank, size = set_rank_size(args.tcp_rank, args.tcp_ports)
+	get_env = lambda: make_env(args.env_name, args.render)
+	model = all_models[args.model]
+	if rank>0:
+		EnvWorker(make_env=get_env).start()
+	elif args.trial:
+		trial(make_env=get_env, model=model, checkpoint=checkpoint, render=args.render)
+	else:
+		train(make_env=get_env, model=model, ports=list(range(1,size)), steps=args.steps, checkpoint=checkpoint, render=args.render, worldmodel=args.iternum>=0)
+
+
+Step:       0, Reward: -44.631 [16.888], Avg: -44.631 (1.0000) <0-00:00:00> 
+Step:    1000, Reward: -45.366 [20.441], Avg: -44.998 (0.9800) <0-00:01:11> 
+Step:    2000, Reward: -48.864 [25.909], Avg: -46.287 (0.9604) <0-00:02:27> 
+Step:    3000, Reward: -35.368 [22.644], Avg: -43.557 (0.9412) <0-00:03:43> 
+Step:    4000, Reward: -47.078 [21.304], Avg: -44.261 (0.9224) <0-00:04:59> 
+Step:    5000, Reward: -42.322 [19.183], Avg: -43.938 (0.9039) <0-00:06:16> 
+Step:    6000, Reward: -50.527 [18.552], Avg: -44.879 (0.8858) <0-00:07:32> 
+Step:    7000, Reward: -28.451 [37.389], Avg: -42.826 (0.8681) <0-00:08:50> 
+Step:    8000, Reward: -34.97 [31.087], Avg: -41.953 (0.8508) <0-00:10:07> 
+Step:    9000, Reward: -37.733 [20.421], Avg: -41.531 (0.8337) <0-00:11:22> 
+Step:   10000, Reward: -37.619 [20.282], Avg: -41.175 (0.8171) <0-00:12:40> 
+Step:   11000, Reward: -32.631 [19.960], Avg: -40.463 (0.8007) <0-00:13:57> 
+Step:   12000, Reward: -33.455 [25.608], Avg: -39.924 (0.7847) <0-00:15:13> 
+Step:   13000, Reward: -28.123 [24.333], Avg: -39.081 (0.7690) <0-00:16:29> 
+Step:   14000, Reward: -26.507 [24.999], Avg: -38.243 (0.7536) <0-00:17:46> 
+Step:   15000, Reward: -21.724 [29.010], Avg: -37.211 (0.7386) <0-00:19:03> 
+Step:   16000, Reward: -29.373 [31.685], Avg: -36.75 (0.7238) <0-00:20:19> 
+Step:   17000, Reward: -17.108 [37.147], Avg: -35.658 (0.7093) <0-00:21:36> 
+Step:   18000, Reward: -25.291 [24.043], Avg: -35.113 (0.6951) <0-00:22:52> 
+Step:   19000, Reward: -3.099 [31.313], Avg: -33.512 (0.6812) <0-00:24:09> 
+Step:   20000, Reward: -34.237 [48.573], Avg: -33.547 (0.6676) <0-00:25:25> 
+Step:   21000, Reward: -7.826 [45.677], Avg: -32.377 (0.6543) <0-00:26:40> 
+Step:   22000, Reward: 18.854 [42.454], Avg: -30.15 (0.6412) <0-00:27:56> 
+Step:   23000, Reward: -6.053 [39.474], Avg: -29.146 (0.6283) <0-00:29:13> 
+Step:   24000, Reward: 13.711 [66.840], Avg: -27.432 (0.6158) <0-00:30:30> 
+Step:   25000, Reward: 36.088 [62.394], Avg: -24.989 (0.6035) <0-00:31:46> 
+Step:   26000, Reward: 3.359 [73.890], Avg: -23.939 (0.5914) <0-00:33:03> 
+Step:   27000, Reward: 37.051 [94.300], Avg: -21.76 (0.5796) <0-00:34:19> 
+Step:   28000, Reward: 48.268 [77.758], Avg: -19.346 (0.5680) <0-00:35:35> 
+Step:   29000, Reward: 60.679 [96.828], Avg: -16.678 (0.5566) <0-00:36:52> 
+Step:   30000, Reward: 51.887 [80.565], Avg: -14.466 (0.5455) <0-00:38:10> 
+Step:   31000, Reward: 112.871 [88.437], Avg: -10.487 (0.5346) <0-00:39:26> 
+Step:   32000, Reward: 149.615 [77.017], Avg: -5.636 (0.5239) <0-00:40:41> 
+Step:   33000, Reward: 143.342 [48.904], Avg: -1.254 (0.5134) <0-00:41:58> 
+Step:   34000, Reward: 114.56 [73.758], Avg: 2.055 (0.5031) <0-00:43:14> 
+Step:   35000, Reward: 142.024 [78.252], Avg: 5.943 (0.4931) <0-00:44:30> 
+Step:   36000, Reward: 136.337 [74.424], Avg: 9.467 (0.4832) <0-00:45:46> 
+Step:   37000, Reward: 109.718 [75.423], Avg: 12.105 (0.4735) <0-00:47:03> 
+Step:   38000, Reward: 140.841 [97.866], Avg: 15.406 (0.4641) <0-00:48:20> 
+Step:   39000, Reward: 100.103 [107.168], Avg: 17.524 (0.4548) <0-00:49:36> 
+Step:   40000, Reward: 151.916 [126.118], Avg: 20.802 (0.4457) <0-00:50:53> 
+Step:   41000, Reward: 133.484 [140.328], Avg: 23.485 (0.4368) <0-00:52:09> 
+Step:   42000, Reward: 71.741 [111.407], Avg: 24.607 (0.4281) <0-00:53:24> 
+Step:   43000, Reward: 151.082 [111.658], Avg: 27.481 (0.4195) <0-00:54:40> 
+Step:   44000, Reward: 74.85 [72.521], Avg: 28.534 (0.4111) <0-00:55:57> 
+Step:   45000, Reward: 152.296 [135.435], Avg: 31.224 (0.4029) <0-00:57:14> 
+Step:   46000, Reward: 118.624 [141.559], Avg: 33.084 (0.3948) <0-00:58:30> 
+Step:   47000, Reward: 152.486 [119.184], Avg: 35.571 (0.3869) <0-00:59:46> 
+Step:   48000, Reward: 248.761 [141.876], Avg: 39.922 (0.3792) <0-01:01:03> 
+Step:   49000, Reward: 206.14 [122.189], Avg: 43.247 (0.3716) <0-01:02:19> 
+Step:   50000, Reward: 320.021 [77.647], Avg: 48.674 (0.3642) <0-01:03:35> 
+Step:   51000, Reward: 249.836 [104.416], Avg: 52.542 (0.3569) <0-01:04:52> 
+Step:   52000, Reward: 252.126 [98.191], Avg: 56.308 (0.3497) <0-01:06:09> 
+Step:   53000, Reward: 270.555 [138.347], Avg: 60.275 (0.3428) <0-01:07:25> 
+Step:   54000, Reward: 267.019 [66.399], Avg: 64.034 (0.3359) <0-01:08:41> 
+Step:   55000, Reward: 291.899 [106.193], Avg: 68.103 (0.3292) <0-01:09:57> 
+Step:   56000, Reward: 333.808 [158.473], Avg: 72.765 (0.3226) <0-01:11:13> 
+Step:   57000, Reward: 372.95 [153.957], Avg: 77.94 (0.3161) <0-01:12:29> 
+Step:   58000, Reward: 400.052 [123.924], Avg: 83.4 (0.3098) <0-01:13:46> 
+Step:   59000, Reward: 359.931 [132.413], Avg: 88.009 (0.3036) <0-01:15:03> 
+Step:   60000, Reward: 364.837 [207.977], Avg: 92.547 (0.2976) <0-01:16:19> 
+Step:   61000, Reward: 326.803 [188.116], Avg: 96.325 (0.2916) <0-01:17:35> 
+Step:   62000, Reward: 335.629 [181.074], Avg: 100.124 (0.2858) <0-01:18:52> 
+Step:   63000, Reward: 320.563 [176.848], Avg: 103.568 (0.2801) <0-01:20:08> 
+Step:   64000, Reward: 432.788 [140.039], Avg: 108.633 (0.2745) <0-01:21:25> 
+Step:   65000, Reward: 558.469 [229.951], Avg: 115.449 (0.2690) <0-01:22:40> 
+Step:   66000, Reward: 604.172 [141.156], Avg: 122.743 (0.2636) <0-01:23:57> 
+Step:   67000, Reward: 576.54 [228.010], Avg: 129.417 (0.2583) <0-01:25:13> 
+Step:   68000, Reward: 619.98 [188.284], Avg: 136.526 (0.2531) <0-01:26:30> 
+Step:   69000, Reward: 647.437 [156.302], Avg: 143.825 (0.2481) <0-01:27:46> 
+Step:   70000, Reward: 594.979 [82.306], Avg: 150.179 (0.2431) <0-01:29:02> 
+Step:   71000, Reward: 599.275 [69.678], Avg: 156.417 (0.2383) <0-01:30:19> 
+Step:   72000, Reward: 615.923 [88.794], Avg: 162.711 (0.2335) <0-01:31:34> 
+Step:   73000, Reward: 585.269 [126.857], Avg: 168.422 (0.2288) <0-01:32:51> 
+Step:   74000, Reward: 702.005 [80.203], Avg: 175.536 (0.2242) <0-01:34:07> 
+Step:   75000, Reward: 657.467 [108.644], Avg: 181.877 (0.2198) <0-01:35:24> 
+Step:   76000, Reward: 700.836 [71.771], Avg: 188.617 (0.2154) <0-01:36:40> 
+Step:   77000, Reward: 803.551 [122.405], Avg: 196.501 (0.2111) <0-01:37:57> 
+Step:   78000, Reward: 402.417 [263.809], Avg: 199.107 (0.2068) <0-01:39:14> 
+Step:   79000, Reward: 643.159 [245.341], Avg: 204.658 (0.2027) <0-01:40:30> 
+Step:   80000, Reward: 509.166 [246.329], Avg: 208.417 (0.1986) <0-01:41:46> 
+Step:   81000, Reward: 664.175 [148.838], Avg: 213.975 (0.1947) <0-01:43:03> 
+Step:   82000, Reward: 815.399 [80.500], Avg: 221.221 (0.1908) <0-01:44:20> 
+Step:   83000, Reward: 663.944 [260.119], Avg: 226.492 (0.1870) <0-01:45:39> 
+Step:   84000, Reward: 736.352 [184.712], Avg: 232.49 (0.1832) <0-01:46:55> 
+Step:   85000, Reward: 749.427 [215.130], Avg: 238.501 (0.1796) <0-01:48:14> 
+Step:   86000, Reward: 848.332 [110.052], Avg: 245.511 (0.1760) <0-01:49:30> 
+Step:   87000, Reward: 859.783 [56.855], Avg: 252.491 (0.1725) <0-01:50:47> 
+Step:   88000, Reward: 855.86 [99.533], Avg: 259.27 (0.1690) <0-01:52:02> 
+Step:   89000, Reward: 845.788 [60.570], Avg: 265.787 (0.1656) <0-01:53:19> 
+Step:   90000, Reward: 792.041 [70.876], Avg: 271.57 (0.1623) <0-01:54:35> 
+Step:   91000, Reward: 823.571 [102.483], Avg: 277.57 (0.1591) <0-01:55:52> 
+Step:   92000, Reward: 769.703 [125.948], Avg: 282.862 (0.1559) <0-01:57:08> 
+Step:   93000, Reward: 787.412 [211.593], Avg: 288.23 (0.1528) <0-01:58:25> 
+Step:   94000, Reward: 674.961 [259.422], Avg: 292.3 (0.1497) <0-01:59:42> 
+Step:   95000, Reward: 453.56 [182.791], Avg: 293.98 (0.1467) <0-02:00:59> 
+Step:   96000, Reward: 569.936 [220.110], Avg: 296.825 (0.1438) <0-02:02:16> 
+Step:   97000, Reward: 490.897 [243.334], Avg: 298.805 (0.1409) <0-02:03:33> 
+Step:   98000, Reward: 504.333 [233.372], Avg: 300.881 (0.1381) <0-02:04:49> 
+Step:   99000, Reward: 571.738 [216.859], Avg: 303.59 (0.1353) <0-02:06:06> 
+Step:  100000, Reward: 552.157 [205.118], Avg: 306.051 (0.1326) <0-02:07:23> 
+Step:  101000, Reward: 611.483 [266.768], Avg: 309.046 (0.1300) <0-02:08:39> 
+Step:  102000, Reward: 570.778 [270.071], Avg: 311.587 (0.1274) <0-02:09:57> 
+Step:  103000, Reward: 750.485 [173.240], Avg: 315.807 (0.1248) <0-02:11:15> 
+Step:  104000, Reward: 862.303 [73.920], Avg: 321.012 (0.1223) <0-02:12:32> 
+Step:  105000, Reward: 692.811 [197.127], Avg: 324.519 (0.1199) <0-02:13:49> 
+Step:  106000, Reward: 723.639 [257.963], Avg: 328.249 (0.1175) <0-02:15:06> 
+Step:  107000, Reward: 647.411 [246.844], Avg: 331.204 (0.1151) <0-02:16:22> 
+Step:  108000, Reward: 577.898 [249.641], Avg: 333.468 (0.1128) <0-02:17:40> 
+Step:  109000, Reward: 540.189 [251.035], Avg: 335.347 (0.1106) <0-02:18:57> 
+Step:  110000, Reward: 542.648 [233.424], Avg: 337.214 (0.1084) <0-02:20:14> 
+Step:  111000, Reward: 611.318 [314.363], Avg: 339.662 (0.1062) <0-02:21:31> 
+Step:  112000, Reward: 682.916 [172.364], Avg: 342.699 (0.1041) <0-02:22:48> 
+Step:  113000, Reward: 728.859 [264.342], Avg: 346.087 (0.1020) <0-02:24:05> 
+Step:  114000, Reward: 727.357 [185.754], Avg: 349.402 (0.0999) <0-02:25:26> 
+Step:  115000, Reward: 751.79 [209.624], Avg: 352.871 (0.0979) <0-02:26:43> 
+Step:  116000, Reward: 655.248 [237.074], Avg: 355.456 (0.0960) <0-02:28:00> 
+Step:  117000, Reward: 570.417 [213.440], Avg: 357.277 (0.0941) <0-02:29:18> 
+Step:  118000, Reward: 741.999 [205.792], Avg: 360.51 (0.0922) <0-02:30:36> 
+Step:  119000, Reward: 817.255 [67.638], Avg: 364.316 (0.0903) <0-02:31:54> 
+Step:  120000, Reward: 829.405 [40.822], Avg: 368.16 (0.0885) <0-02:33:12> 
+Step:  121000, Reward: 719.652 [230.455], Avg: 371.041 (0.0868) <0-02:34:29> 
+Step:  122000, Reward: 847.056 [66.326], Avg: 374.911 (0.0850) <0-02:35:47> 
+Step:  123000, Reward: 819.773 [80.022], Avg: 378.499 (0.0833) <0-02:37:04> 
+Step:  124000, Reward: 841.272 [71.151], Avg: 382.201 (0.0817) <0-02:38:21> 
+Step:  125000, Reward: 757.694 [195.930], Avg: 385.181 (0.0800) <0-02:39:38> 
+Step:  126000, Reward: 819.264 [75.400], Avg: 388.599 (0.0784) <0-02:40:55> 
+Step:  127000, Reward: 848.195 [62.172], Avg: 392.19 (0.0769) <0-02:42:12> 
+Step:  128000, Reward: 819.211 [142.999], Avg: 395.5 (0.0753) <0-02:43:29> 
+Step:  129000, Reward: 741.089 [149.829], Avg: 398.158 (0.0738) <0-02:44:46> 
+Step:  130000, Reward: 700.996 [174.624], Avg: 400.47 (0.0723) <0-02:46:02> 
+Step:  131000, Reward: 784.538 [148.457], Avg: 403.38 (0.0709) <0-02:47:20> 
+Step:  132000, Reward: 805.4 [98.218], Avg: 406.402 (0.0695) <0-02:48:37> 
+Step:  133000, Reward: 858.932 [45.894], Avg: 409.779 (0.0681) <0-02:49:54> 
+Step:  134000, Reward: 722.468 [173.725], Avg: 412.096 (0.0667) <0-02:51:11> 
+Step:  135000, Reward: 824.751 [25.579], Avg: 415.13 (0.0654) <0-02:52:28> 
+Step:  136000, Reward: 776.932 [210.945], Avg: 417.771 (0.0641) <0-02:53:45> 
+Step:  137000, Reward: 822.711 [65.731], Avg: 420.705 (0.0628) <0-02:55:04> 
+Step:  138000, Reward: 842.004 [110.149], Avg: 423.736 (0.0615) <0-02:56:20> 
+Step:  139000, Reward: 772.858 [134.644], Avg: 426.23 (0.0603) <0-02:57:39> 
+Step:  140000, Reward: 881.007 [33.146], Avg: 429.455 (0.0591) <0-02:58:55> 
+Step:  141000, Reward: 856.398 [54.634], Avg: 432.462 (0.0579) <0-03:00:13> 
+Step:  142000, Reward: 813.353 [152.087], Avg: 435.125 (0.0568) <0-03:01:30> 
+Step:  143000, Reward: 787.837 [59.035], Avg: 437.575 (0.0556) <0-03:02:47> 
+Step:  144000, Reward: 765.55 [271.768], Avg: 439.837 (0.0545) <0-03:04:04> 
+Step:  145000, Reward: 862.245 [66.233], Avg: 442.73 (0.0534) <0-03:05:21> 
+Step:  146000, Reward: 751.969 [206.878], Avg: 444.834 (0.0524) <0-03:06:39> 
+Step:  147000, Reward: 868.12 [103.103], Avg: 447.694 (0.0513) <0-03:07:56> 
+Step:  148000, Reward: 877.584 [39.731], Avg: 450.579 (0.0503) <0-03:09:14> 
+Step:  149000, Reward: 866.97 [133.271], Avg: 453.355 (0.0493) <0-03:10:31> 
+Step:  150000, Reward: 887.532 [31.571], Avg: 456.23 (0.0483) <0-03:11:48> 
+Step:  151000, Reward: 847.717 [83.420], Avg: 458.806 (0.0473) <0-03:13:05> 
+Step:  152000, Reward: 886.527 [29.114], Avg: 461.601 (0.0464) <0-03:14:23> 
+Step:  153000, Reward: 886.158 [21.612], Avg: 464.358 (0.0455) <0-03:15:40> 
+Step:  154000, Reward: 870.177 [22.922], Avg: 466.976 (0.0445) <0-03:16:57> 
+Step:  155000, Reward: 886.281 [26.259], Avg: 469.664 (0.0437) <0-03:18:14> 
+Step:  156000, Reward: 893.972 [24.004], Avg: 472.367 (0.0428) <0-03:19:31> 
+Step:  157000, Reward: 802.999 [125.962], Avg: 474.459 (0.0419) <0-03:20:48> 
+Step:  158000, Reward: 887.642 [26.919], Avg: 477.058 (0.0411) <0-03:22:05> 
+Step:  159000, Reward: 591.953 [257.523], Avg: 477.776 (0.0403) <0-03:23:22> 
+Step:  160000, Reward: 880.623 [36.232], Avg: 480.278 (0.0395) <0-03:24:39> 
+Step:  161000, Reward: 836.962 [146.136], Avg: 482.48 (0.0387) <0-03:25:56> 
+Step:  162000, Reward: 834.231 [128.890], Avg: 484.638 (0.0379) <0-03:27:14> 
+Step:  163000, Reward: 870.514 [26.000], Avg: 486.991 (0.0371) <0-03:28:31> 
+Step:  164000, Reward: 851.622 [44.220], Avg: 489.201 (0.0364) <0-03:29:48> 
+Step:  165000, Reward: 870.089 [15.247], Avg: 491.495 (0.0357) <0-03:31:05> 
+Step:  166000, Reward: 861.563 [16.469], Avg: 493.711 (0.0350) <0-03:32:22> 
+Step:  167000, Reward: 887.02 [23.375], Avg: 496.052 (0.0343) <0-03:33:39> 
+Step:  168000, Reward: 844.794 [118.063], Avg: 498.116 (0.0336) <0-03:34:56> 
+Step:  169000, Reward: 820.696 [203.943], Avg: 500.013 (0.0322) <0-03:36:13> 
+Step:  170000, Reward: 652.677 [232.741], Avg: 500.906 (0.0316) <0-03:37:31> 
+Step:  171000, Reward: 765.522 [198.039], Avg: 502.445 (0.0310) <0-03:38:49> 
+Step:  172000, Reward: 658.42 [293.641], Avg: 503.346 (0.0303) <0-03:40:06> 
+Step:  173000, Reward: 664.315 [246.867], Avg: 504.271 (0.0297) <0-03:41:23> 
+Step:  174000, Reward: 820.733 [104.240], Avg: 506.08 (0.0291) <0-03:42:40> 
+Step:  175000, Reward: 839.531 [163.356], Avg: 507.974 (0.0286) <0-03:43:57> 
+Step:  176000, Reward: 890.089 [62.157], Avg: 510.133 (0.0280) <0-03:45:13> 
+Step:  177000, Reward: 799.144 [210.690], Avg: 511.757 (0.0274) <0-03:46:30> 
+Step:  178000, Reward: 792.609 [179.131], Avg: 513.326 (0.0263) <0-03:47:47> 
+Step:  179000, Reward: 836.513 [170.002], Avg: 515.121 (0.0258) <0-03:49:04> 
+Step:  180000, Reward: 743.804 [224.908], Avg: 516.385 (0.0253) <0-03:50:21> 
+Step:  181000, Reward: 803.384 [167.552], Avg: 517.962 (0.0248) <0-03:51:39> 
+Step:  182000, Reward: 644.422 [294.579], Avg: 518.653 (0.0243) <0-03:52:56> 
+Step:  183000, Reward: 580.561 [227.344], Avg: 518.989 (0.0238) <0-03:54:13> 
+Step:  184000, Reward: 864.396 [67.061], Avg: 520.856 (0.0233) <0-03:55:30> 
+Step:  185000, Reward: 783.209 [162.558], Avg: 522.267 (0.0229) <0-03:56:47> 
+Step:  186000, Reward: 836.462 [115.919], Avg: 523.947 (0.0224) <0-03:58:04> 
+Step:  187000, Reward: 879.939 [56.384], Avg: 525.84 (0.0220) <0-03:59:21> 
+Step:  188000, Reward: 855.103 [63.208], Avg: 527.583 (0.0215) <0-04:00:39> 
+Step:  189000, Reward: 848.855 [71.544], Avg: 529.273 (0.0211) <0-04:01:56> 
+Step:  190000, Reward: 739.476 [207.197], Avg: 530.374 (0.0203) <0-04:03:13> 
+Step:  191000, Reward: 670.967 [226.750], Avg: 531.106 (0.0200) <0-04:04:31> 
+Step:  192000, Reward: 701.83 [250.265], Avg: 531.991 (0.0200) <0-04:05:48> 
+Step:  193000, Reward: 848.82 [119.493], Avg: 533.624 (0.0200) <0-04:07:05> 
+Step:  194000, Reward: 804.948 [199.510], Avg: 535.015 (0.0200) <0-04:08:22> 
+Step:  195000, Reward: 811.313 [162.590], Avg: 536.425 (0.0200) <0-04:09:39> 
+Step:  196000, Reward: 649.407 [242.342], Avg: 536.999 (0.0200) <0-04:10:56> 
+Step:  197000, Reward: 871.124 [64.452], Avg: 538.686 (0.0200) <0-04:12:12> 
+Step:  198000, Reward: 906.509 [25.265], Avg: 540.534 (0.0200) <0-04:13:31> 
+Step:  199000, Reward: 881.177 [11.127], Avg: 542.238 (0.0200) <0-04:14:48> 
+Step:  200000, Reward: 831.057 [173.242], Avg: 543.675 (0.0200) <0-04:16:07> 
+Step:  201000, Reward: 852.646 [50.770], Avg: 545.204 (0.0200) <0-04:17:24> 
+Step:  202000, Reward: 916.111 [17.884], Avg: 547.031 (0.0200) <0-04:18:41> 
+Step:  203000, Reward: 921.638 [10.491], Avg: 548.868 (0.0200) <0-04:19:58> 
+Step:  204000, Reward: 883.444 [97.660], Avg: 550.5 (0.0200) <0-04:21:16> 
+Step:  205000, Reward: 790.008 [112.597], Avg: 551.662 (0.0200) <0-04:22:33> 
+Step:  206000, Reward: 793.135 [224.140], Avg: 552.829 (0.0200) <0-04:23:50> 
+Step:  207000, Reward: 815.881 [193.885], Avg: 554.094 (0.0200) <0-04:25:06> 
+Step:  208000, Reward: 791.413 [199.248], Avg: 555.229 (0.0200) <0-04:26:24> 
+Step:  209000, Reward: 870.953 [109.901], Avg: 556.732 (0.0200) <0-04:27:40> 
+Step:  210000, Reward: 713.892 [259.610], Avg: 557.477 (0.0200) <0-04:28:57> 
+Step:  211000, Reward: 762.693 [253.086], Avg: 558.445 (0.0200) <0-04:30:14> 
+Step:  212000, Reward: 686.876 [203.581], Avg: 559.048 (0.0200) <0-04:31:32> 
+Step:  213000, Reward: 817.488 [160.013], Avg: 560.256 (0.0200) <0-04:32:49> 
+Step:  214000, Reward: 862.345 [130.558], Avg: 561.661 (0.0200) <0-04:34:06> 
+Step:  215000, Reward: 796.406 [182.596], Avg: 562.748 (0.0200) <0-04:35:24> 
+Step:  216000, Reward: 897.186 [20.008], Avg: 564.289 (0.0200) <0-04:36:40> 
+Step:  217000, Reward: 857.773 [128.376], Avg: 565.635 (0.0200) <0-04:37:57> 
+Step:  218000, Reward: 815.599 [211.954], Avg: 566.777 (0.0200) <0-04:39:14> 
+Step:  219000, Reward: 713.265 [226.311], Avg: 567.442 (0.0200) <0-04:40:31> 
+Step:  220000, Reward: 863.279 [44.218], Avg: 568.781 (0.0200) <0-04:41:48> 
+Step:  221000, Reward: 894.745 [25.166], Avg: 570.249 (0.0200) <0-04:43:05> 
+Step:  222000, Reward: 895.506 [21.829], Avg: 571.708 (0.0200) <0-04:44:21> 
+Step:  223000, Reward: 870.297 [62.326], Avg: 573.041 (0.0200) <0-04:45:39> 
+Step:  224000, Reward: 857.979 [48.419], Avg: 574.307 (0.0200) <0-04:46:57> 
+Step:  225000, Reward: 863.782 [82.803], Avg: 575.588 (0.0200) <0-04:48:15> 
+Step:  226000, Reward: 830.723 [91.210], Avg: 576.712 (0.0200) <0-04:49:31> 
+Step:  227000, Reward: 892.249 [29.064], Avg: 578.096 (0.0200) <0-04:50:49> 
+Step:  228000, Reward: 857.054 [108.292], Avg: 579.314 (0.0200) <0-04:52:06> 
+Step:  229000, Reward: 871.801 [129.313], Avg: 580.586 (0.0200) <0-04:53:23> 
+Step:  230000, Reward: 820.373 [210.795], Avg: 581.624 (0.0200) <0-04:54:40> 
+Step:  231000, Reward: 905.38 [25.398], Avg: 583.019 (0.0200) <0-04:55:58> 
+Step:  232000, Reward: 840.326 [130.361], Avg: 584.124 (0.0200) <0-04:57:15> 
+Step:  233000, Reward: 841.72 [115.435], Avg: 585.225 (0.0200) <0-04:58:32> 
+Step:  234000, Reward: 871.575 [30.514], Avg: 586.443 (0.0200) <0-04:59:49> 
+Step:  235000, Reward: 886.129 [22.776], Avg: 587.713 (0.0200) <0-05:01:06> 
+Step:  236000, Reward: 889.505 [41.893], Avg: 588.986 (0.0200) <0-05:02:22> 
+Step:  237000, Reward: 870.603 [67.267], Avg: 590.17 (0.0200) <0-05:03:40> 
+Step:  238000, Reward: 805.579 [171.304], Avg: 591.071 (0.0200) <0-05:04:58> 
+Step:  239000, Reward: 867.807 [110.510], Avg: 592.224 (0.0200) <0-05:06:15> 
+Step:  240000, Reward: 819.486 [140.162], Avg: 593.167 (0.0200) <0-05:07:33> 
+Step:  241000, Reward: 920.585 [22.714], Avg: 594.52 (0.0200) <0-05:08:50> 
+Step:  242000, Reward: 892.548 [25.169], Avg: 595.746 (0.0200) <0-05:10:07> 
+Step:  243000, Reward: 874.258 [98.791], Avg: 596.888 (0.0200) <0-05:11:23> 
+Step:  244000, Reward: 887.648 [83.835], Avg: 598.075 (0.0200) <0-05:12:40> 
+Step:  245000, Reward: 843.419 [136.348], Avg: 599.072 (0.0200) <0-05:13:58> 
+Step:  246000, Reward: 897.121 [47.325], Avg: 600.279 (0.0200) <0-05:15:16> 
+Step:  247000, Reward: 902.82 [23.644], Avg: 601.499 (0.0200) <0-05:16:32> 
+Step:  248000, Reward: 891.054 [45.535], Avg: 602.661 (0.0200) <0-05:17:50> 
+Step:  249000, Reward: 759.108 [152.744], Avg: 603.287 (0.0200) <0-05:19:07> 
+Step:  250000, Reward: 891.112 [27.559], Avg: 604.434 (0.0200) <0-05:20:24> 
+Step:  251000, Reward: 892.381 [63.559], Avg: 605.577 (0.0200) <0-05:21:40> 
+Step:  252000, Reward: 845.948 [151.404], Avg: 606.527 (0.0200) <0-05:22:57> 
+Step:  253000, Reward: 890.997 [25.519], Avg: 607.647 (0.0200) <0-05:24:15> 
+Step:  254000, Reward: 879.24 [82.776], Avg: 608.712 (0.0200) <0-05:25:34> 
+Step:  255000, Reward: 900.601 [45.335], Avg: 609.852 (0.0200) <0-05:26:51> 
+Step:  256000, Reward: 834.235 [166.976], Avg: 610.725 (0.0200) <0-05:28:08> 
+Step:  257000, Reward: 801.355 [167.407], Avg: 611.464 (0.0200) <0-05:29:25> 
+Step:  258000, Reward: 842.731 [169.915], Avg: 612.357 (0.0200) <0-05:30:42> 
+Step:  259000, Reward: 899.536 [43.965], Avg: 613.461 (0.0200) <0-05:31:59> 
+Step:  260000, Reward: 882.27 [80.257], Avg: 614.491 (0.0200) <0-05:33:17> 
+Step:  261000, Reward: 810.178 [158.369], Avg: 615.238 (0.0200) <0-05:34:34> 
+Step:  262000, Reward: 772.25 [182.496], Avg: 615.835 (0.0200) <0-05:35:51> 
+Step:  263000, Reward: 855.363 [137.406], Avg: 616.742 (0.0200) <0-05:37:09> 
+Step:  264000, Reward: 868.166 [107.366], Avg: 617.691 (0.0200) <0-05:38:26> 
+Step:  265000, Reward: 755.897 [179.669], Avg: 618.211 (0.0200) <0-05:39:43> 
+Step:  266000, Reward: 897.632 [53.243], Avg: 619.257 (0.0200) <0-05:41:01> 
+Step:  267000, Reward: 756.317 [164.856], Avg: 619.769 (0.0200) <0-05:42:17> 
+Step:  268000, Reward: 780.341 [214.645], Avg: 620.366 (0.0200) <0-05:43:35> 
+Step:  269000, Reward: 843.061 [103.496], Avg: 621.19 (0.0200) <0-05:44:52> 
+Step:  270000, Reward: 837.006 [153.787], Avg: 621.987 (0.0200) <0-05:46:09> 
+Step:  271000, Reward: 851.4 [116.799], Avg: 622.83 (0.0200) <0-05:47:25> 
+Step:  272000, Reward: 872.155 [20.437], Avg: 623.743 (0.0200) <0-05:48:42> 
+Step:  273000, Reward: 872.446 [47.466], Avg: 624.651 (0.0200) <0-05:50:00> 
+Step:  274000, Reward: 904.509 [23.490], Avg: 625.669 (0.0200) <0-05:51:18> 
+Step:  275000, Reward: 867.006 [78.414], Avg: 626.543 (0.0200) <0-05:52:34> 
+Step:  276000, Reward: 894.88 [26.222], Avg: 627.512 (0.0200) <0-05:53:53> 
+Step:  277000, Reward: 882.824 [20.245], Avg: 628.43 (0.0200) <0-05:55:10> 
+Step:  278000, Reward: 895.736 [51.412], Avg: 629.388 (0.0200) <0-05:56:27> 
+Step:  279000, Reward: 852.501 [153.878], Avg: 630.185 (0.0200) <0-05:57:44> 
+Step:  280000, Reward: 890.21 [20.750], Avg: 631.111 (0.0200) <0-05:59:01> 
+Step:  281000, Reward: 897.252 [20.674], Avg: 632.054 (0.0200) <0-06:00:18> 
+Step:  282000, Reward: 868.053 [30.271], Avg: 632.888 (0.0200) <0-06:01:34> 
+Step:  283000, Reward: 865.945 [32.640], Avg: 633.709 (0.0200) <0-06:02:51> 
+Step:  284000, Reward: 844.657 [138.191], Avg: 634.449 (0.0200) <0-06:04:09> 
+Step:  285000, Reward: 884.934 [34.624], Avg: 635.325 (0.0200) <0-06:05:27> 
+Step:  286000, Reward: 899.338 [25.555], Avg: 636.245 (0.0200) <0-06:06:44> 
+Step:  287000, Reward: 698.252 [287.505], Avg: 636.46 (0.0200) <0-06:08:01> 
+Step:  288000, Reward: 827.438 [86.891], Avg: 637.121 (0.0200) <0-06:09:18> 
+Step:  289000, Reward: 763.566 [214.103], Avg: 637.557 (0.0200) <0-06:10:35> 
+Step:  290000, Reward: 818.592 [164.718], Avg: 638.179 (0.0200) <0-06:11:52> 
+Step:  291000, Reward: 880.388 [35.098], Avg: 639.009 (0.0200) <0-06:13:09> 
+Step:  292000, Reward: 867.221 [23.725], Avg: 639.787 (0.0200) <0-06:14:27> 
+Step:  293000, Reward: 858.627 [88.354], Avg: 640.532 (0.0200) <0-06:15:44> 
+Step:  294000, Reward: 797.186 [161.076], Avg: 641.063 (0.0200) <0-06:17:02> 
+Step:  295000, Reward: 815.06 [90.284], Avg: 641.651 (0.0200) <0-06:18:19> 
+Step:  296000, Reward: 875.938 [42.858], Avg: 642.439 (0.0200) <0-06:19:36> 
+Step:  297000, Reward: 817.051 [118.667], Avg: 643.025 (0.0200) <0-06:20:53> 
+Step:  298000, Reward: 805.498 [194.816], Avg: 643.569 (0.0200) <0-06:22:10> 
+Step:  299000, Reward: 849.549 [109.801], Avg: 644.255 (0.0200) <0-06:23:27> 
+Step:  300000, Reward: 905.642 [27.714], Avg: 645.124 (0.0200) <0-06:24:44> 
+Step:  301000, Reward: 897.248 [29.320], Avg: 645.959 (0.0200) <0-06:26:01> 
+Step:  302000, Reward: 892.683 [24.835], Avg: 646.773 (0.0200) <0-06:27:19> 
+Step:  303000, Reward: 792.05 [137.124], Avg: 647.251 (0.0200) <0-06:28:35> 
+Step:  304000, Reward: 852.577 [103.978], Avg: 647.924 (0.0200) <0-06:29:53> 
+Step:  305000, Reward: 824.183 [82.893], Avg: 648.5 (0.0200) <0-06:31:09> 
+Step:  306000, Reward: 864.76 [57.352], Avg: 649.204 (0.0200) <0-06:32:27> 
+Step:  307000, Reward: 794.489 [101.282], Avg: 649.676 (0.0200) <0-06:33:44> 
+Step:  308000, Reward: 769.066 [168.527], Avg: 650.063 (0.0200) <0-06:35:01> 
+Step:  309000, Reward: 875.11 [98.530], Avg: 650.789 (0.0200) <0-06:36:18> 
+Step:  310000, Reward: 844.005 [100.653], Avg: 651.41 (0.0200) <0-06:37:36> 
+Step:  311000, Reward: 687.518 [232.726], Avg: 651.526 (0.0200) <0-06:38:53> 
+Step:  312000, Reward: 860.247 [79.951], Avg: 652.192 (0.0200) <0-06:40:10> 
+Step:  313000, Reward: 836.133 [131.121], Avg: 652.778 (0.0200) <0-06:41:27> 
+Step:  314000, Reward: 837.253 [154.490], Avg: 653.364 (0.0200) <0-06:42:44> 
+Step:  315000, Reward: 812.996 [147.968], Avg: 653.869 (0.0200) <0-06:44:01> 
+Step:  316000, Reward: 859.645 [170.262], Avg: 654.518 (0.0200) <0-06:45:18> 
+Step:  317000, Reward: 895.587 [38.546], Avg: 655.276 (0.0200) <0-06:46:36> 
+Step:  318000, Reward: 908.803 [25.855], Avg: 656.071 (0.0200) <0-06:47:53> 
+Step:  319000, Reward: 921.616 [22.049], Avg: 656.901 (0.0200) <0-06:49:10> 
+Step:  320000, Reward: 908.201 [27.948], Avg: 657.684 (0.0200) <0-06:50:27> 
+Step:  321000, Reward: 896.707 [68.159], Avg: 658.426 (0.0200) <0-06:51:44> 
+Step:  322000, Reward: 876.43 [104.323], Avg: 659.101 (0.0200) <0-06:53:02> 
+Step:  323000, Reward: 871.882 [144.383], Avg: 659.758 (0.0200) <0-06:54:19> 
+Step:  324000, Reward: 875.666 [59.632], Avg: 660.422 (0.0200) <0-06:55:36> 
+Step:  325000, Reward: 787.225 [197.845], Avg: 660.811 (0.0200) <0-06:56:53> 
+Step:  326000, Reward: 873.366 [25.105], Avg: 661.461 (0.0200) <0-06:58:10> 
+Step:  327000, Reward: 869.511 [113.829], Avg: 662.095 (0.0200) <0-06:59:27> 
+Step:  328000, Reward: 895.176 [85.167], Avg: 662.804 (0.0200) <0-07:00:44> 
+Step:  329000, Reward: 896.589 [58.327], Avg: 663.512 (0.0200) <0-07:02:00> 
+Step:  330000, Reward: 916.563 [25.472], Avg: 664.277 (0.0200) <0-07:03:17> 
+Step:  331000, Reward: 760.112 [176.917], Avg: 664.565 (0.0200) <0-07:04:36> 
+Step:  332000, Reward: 908.485 [52.507], Avg: 665.298 (0.0200) <0-07:05:53> 
+Step:  333000, Reward: 909.592 [31.451], Avg: 666.029 (0.0200) <0-07:07:11> 
+Step:  334000, Reward: 694.465 [180.750], Avg: 666.114 (0.0200) <0-07:08:28> 
+Step:  335000, Reward: 814.787 [132.962], Avg: 666.557 (0.0200) <0-07:09:45> 
+Step:  336000, Reward: 869.917 [103.241], Avg: 667.16 (0.0200) <0-07:11:03> 
+Step:  337000, Reward: 881.542 [20.381], Avg: 667.794 (0.0200) <0-07:12:19> 
+Step:  338000, Reward: 877.116 [25.820], Avg: 668.412 (0.0200) <0-07:13:36> 
+Step:  339000, Reward: 900.265 [20.827], Avg: 669.094 (0.0200) <0-07:14:54> 
+Step:  340000, Reward: 887.588 [25.673], Avg: 669.734 (0.0200) <0-07:16:12> 
+Step:  341000, Reward: 877.856 [72.794], Avg: 670.343 (0.0200) <0-07:17:29> 
+Step:  342000, Reward: 862.507 [81.960], Avg: 670.903 (0.0200) <0-07:18:46> 
+Step:  343000, Reward: 861.649 [39.879], Avg: 671.458 (0.0200) <0-07:20:04> 
+Step:  344000, Reward: 740.649 [147.338], Avg: 671.658 (0.0200) <0-07:21:21> 
+Step:  345000, Reward: 791.988 [148.678], Avg: 672.006 (0.0200) <0-07:22:37> 
+Step:  346000, Reward: 731.341 [140.238], Avg: 672.177 (0.0200) <0-07:23:54> 
+Step:  347000, Reward: 836.327 [154.896], Avg: 672.649 (0.0200) <0-07:25:11> 
+Step:  348000, Reward: 854.954 [174.045], Avg: 673.171 (0.0200) <0-07:26:29> 
+Step:  349000, Reward: 871.375 [150.553], Avg: 673.737 (0.0200) <0-07:27:46> 
+Step:  350000, Reward: 891.663 [51.350], Avg: 674.358 (0.0200) <0-07:29:02> 
+Step:  351000, Reward: 879.328 [86.535], Avg: 674.941 (0.0200) <0-07:30:19> 
+Step:  352000, Reward: 876.695 [124.326], Avg: 675.512 (0.0200) <0-07:31:37> 
+Step:  353000, Reward: 909.543 [22.109], Avg: 676.173 (0.0200) <0-07:32:54> 
+Step:  354000, Reward: 898.577 [52.390], Avg: 676.8 (0.0200) <0-07:34:11> 
+Step:  355000, Reward: 872.091 [123.166], Avg: 677.348 (0.0200) <0-07:35:29> 
+Step:  356000, Reward: 809.232 [209.361], Avg: 677.718 (0.0200) <0-07:36:47> 
+Step:  357000, Reward: 858.51 [115.584], Avg: 678.223 (0.0200) <0-07:38:04> 
+Step:  358000, Reward: 895.014 [39.900], Avg: 678.827 (0.0200) <0-07:39:22> 
+Step:  359000, Reward: 865.804 [135.140], Avg: 679.346 (0.0200) <0-07:40:40> 
+Step:  360000, Reward: 911.609 [19.065], Avg: 679.989 (0.0200) <0-07:41:57> 
+Step:  361000, Reward: 897.649 [21.878], Avg: 680.591 (0.0200) <0-07:43:14> 
+Step:  362000, Reward: 848.687 [134.753], Avg: 681.054 (0.0200) <0-07:44:31> 
+Step:  363000, Reward: 822.938 [161.863], Avg: 681.443 (0.0200) <0-07:45:47> 
+Step:  364000, Reward: 860.999 [82.779], Avg: 681.935 (0.0200) <0-07:47:05> 
+Step:  365000, Reward: 781.981 [130.480], Avg: 682.209 (0.0200) <0-07:48:22> 
+Step:  366000, Reward: 901.006 [39.627], Avg: 682.805 (0.0200) <0-07:49:39> 
+Step:  367000, Reward: 886.469 [21.529], Avg: 683.358 (0.0200) <0-07:50:57> 
+Step:  368000, Reward: 814.87 [175.229], Avg: 683.715 (0.0200) <0-07:52:13> 
+Step:  369000, Reward: 854.75 [125.786], Avg: 684.177 (0.0200) <0-07:53:30> 
+Step:  370000, Reward: 891.751 [31.431], Avg: 684.736 (0.0200) <0-07:54:47> 
+Step:  371000, Reward: 876.19 [24.218], Avg: 685.251 (0.0200) <0-07:56:04> 
+Step:  372000, Reward: 893.018 [24.704], Avg: 685.808 (0.0200) <0-07:57:21> 
+Step:  373000, Reward: 860.786 [67.580], Avg: 686.276 (0.0200) <0-07:58:38> 
+Step:  374000, Reward: 863.262 [125.094], Avg: 686.748 (0.0200) <0-07:59:55> 
+Step:  375000, Reward: 876.681 [118.919], Avg: 687.253 (0.0200) <0-08:01:12> 
+Step:  376000, Reward: 832.923 [184.202], Avg: 687.64 (0.0200) <0-08:02:29> 
+Step:  377000, Reward: 905.658 [26.808], Avg: 688.216 (0.0200) <0-08:03:46> 
+Step:  378000, Reward: 854.837 [93.991], Avg: 688.656 (0.0200) <0-08:05:03> 
+Step:  379000, Reward: 832.059 [131.814], Avg: 689.033 (0.0200) <0-08:06:21> 
+Step:  380000, Reward: 874.606 [85.541], Avg: 689.52 (0.0200) <0-08:07:38> 
+Step:  381000, Reward: 895.535 [38.900], Avg: 690.06 (0.0200) <0-08:08:55> 
+Step:  382000, Reward: 902.808 [23.835], Avg: 690.615 (0.0200) <0-08:10:12> 
+Step:  383000, Reward: 899.352 [20.933], Avg: 691.159 (0.0200) <0-08:11:30> 
+Step:  384000, Reward: 890.305 [18.040], Avg: 691.676 (0.0200) <0-08:12:47> 
+Step:  385000, Reward: 882.426 [9.904], Avg: 692.17 (0.0200) <0-08:14:05> 
+Step:  386000, Reward: 896.27 [19.529], Avg: 692.698 (0.0200) <0-08:15:23> 
+Step:  387000, Reward: 890.452 [19.511], Avg: 693.207 (0.0200) <0-08:16:40> 
+Step:  388000, Reward: 903.363 [26.683], Avg: 693.747 (0.0200) <0-08:17:58> 
+Step:  389000, Reward: 887.298 [19.626], Avg: 694.244 (0.0200) <0-08:19:15> 
+Step:  390000, Reward: 891.631 [21.064], Avg: 694.749 (0.0200) <0-08:20:32> 
+Step:  391000, Reward: 770.459 [184.154], Avg: 694.942 (0.0200) <0-08:21:49> 
+Step:  392000, Reward: 862.091 [95.937], Avg: 695.367 (0.0200) <0-08:23:06> 
+Step:  393000, Reward: 845.188 [155.392], Avg: 695.747 (0.0200) <0-08:24:23> 
+Step:  394000, Reward: 874.05 [143.349], Avg: 696.199 (0.0200) <0-08:25:41> 
+Step:  395000, Reward: 897.161 [24.954], Avg: 696.706 (0.0200) <0-08:26:58> 
+Step:  396000, Reward: 807.844 [196.954], Avg: 696.986 (0.0200) <0-08:28:16> 
+Step:  397000, Reward: 761.134 [191.358], Avg: 697.147 (0.0200) <0-08:29:32> 
+Step:  398000, Reward: 867.659 [68.410], Avg: 697.575 (0.0200) <0-08:30:50> 
+Step:  399000, Reward: 879.213 [36.591], Avg: 698.029 (0.0200) <0-08:32:07> 
+Step:  400000, Reward: 867.421 [78.573], Avg: 698.451 (0.0200) <0-08:33:24> 
+Step:  401000, Reward: 922.161 [12.635], Avg: 699.008 (0.0200) <0-08:34:41> 
+Step:  402000, Reward: 905.95 [20.065], Avg: 699.521 (0.0200) <0-08:35:59> 
+Step:  403000, Reward: 835.982 [193.855], Avg: 699.859 (0.0200) <0-08:37:16> 
+Step:  404000, Reward: 887.766 [64.338], Avg: 700.323 (0.0200) <0-08:38:33> 
+Step:  405000, Reward: 907.333 [16.874], Avg: 700.833 (0.0200) <0-08:39:50> 
+Step:  406000, Reward: 873.895 [114.578], Avg: 701.258 (0.0200) <0-08:41:07> 
+Step:  407000, Reward: 883.19 [85.438], Avg: 701.704 (0.0200) <0-08:42:24> 
+Step:  408000, Reward: 859.055 [93.217], Avg: 702.089 (0.0200) <0-08:43:42> 
+Step:  409000, Reward: 891.503 [26.473], Avg: 702.551 (0.0200) <0-08:45:00> 
+Step:  410000, Reward: 898.352 [21.249], Avg: 703.027 (0.0200) <0-08:46:17> 
+Step:  411000, Reward: 863.782 [93.642], Avg: 703.417 (0.0200) <0-08:47:33> 
+Step:  412000, Reward: 881.971 [46.427], Avg: 703.85 (0.0200) <0-08:48:51> 
+Step:  413000, Reward: 871.096 [72.546], Avg: 704.254 (0.0200) <0-08:50:09> 
+Step:  414000, Reward: 866.194 [59.478], Avg: 704.644 (0.0200) <0-08:51:26> 
+Step:  415000, Reward: 869.702 [47.623], Avg: 705.041 (0.0200) <0-08:52:43> 
+Step:  416000, Reward: 897.533 [64.711], Avg: 705.502 (0.0200) <0-08:54:00> 
+Step:  417000, Reward: 907.205 [20.911], Avg: 705.985 (0.0200) <0-08:55:18> 
+Step:  418000, Reward: 910.772 [21.667], Avg: 706.473 (0.0200) <0-08:56:35> 
+Step:  419000, Reward: 894.738 [34.312], Avg: 706.922 (0.0200) <0-08:57:52> 
+Step:  420000, Reward: 903.599 [26.823], Avg: 707.389 (0.0200) <0-08:59:09> 
+Step:  421000, Reward: 916.158 [17.663], Avg: 707.884 (0.0200) <0-09:00:26> 
+Step:  422000, Reward: 903.564 [55.388], Avg: 708.346 (0.0200) <0-09:01:44> 
+Step:  423000, Reward: 906.05 [21.831], Avg: 708.812 (0.0200) <0-09:03:01> 
+Step:  424000, Reward: 908.729 [21.898], Avg: 709.283 (0.0200) <0-09:04:18> 
+Step:  425000, Reward: 799.791 [152.171], Avg: 709.495 (0.0200) <0-09:05:36> 
+Step:  426000, Reward: 868.306 [43.906], Avg: 709.867 (0.0200) <0-09:06:53> 
+Step:  427000, Reward: 820.012 [201.569], Avg: 710.125 (0.0200) <0-09:08:10> 
+Step:  428000, Reward: 857.928 [107.316], Avg: 710.469 (0.0200) <0-09:09:27> 
+Step:  429000, Reward: 907.164 [19.664], Avg: 710.927 (0.0200) <0-09:10:44> 
+Step:  430000, Reward: 861.097 [72.596], Avg: 711.275 (0.0200) <0-09:12:01> 
+Step:  431000, Reward: 871.014 [59.162], Avg: 711.645 (0.0200) <0-09:13:19> 
+Step:  432000, Reward: 801.089 [161.720], Avg: 711.851 (0.0200) <0-09:14:36> 
+Step:  433000, Reward: 877.161 [25.768], Avg: 712.232 (0.0200) <0-09:15:53> 
+Step:  434000, Reward: 795.662 [220.151], Avg: 712.424 (0.0200) <0-09:17:10> 
+Step:  435000, Reward: 900.445 [20.182], Avg: 712.855 (0.0200) <0-09:18:28> 
+Step:  436000, Reward: 892.55 [19.280], Avg: 713.266 (0.0200) <0-09:19:46> 
+Step:  437000, Reward: 839.888 [153.491], Avg: 713.555 (0.0200) <0-09:21:03> 
+Step:  438000, Reward: 871.762 [91.059], Avg: 713.916 (0.0200) <0-09:22:21> 
+Step:  439000, Reward: 788.389 [194.060], Avg: 714.085 (0.0200) <0-09:23:38> 
+Step:  440000, Reward: 880.752 [98.124], Avg: 714.463 (0.0200) <0-09:24:56> 
+Step:  441000, Reward: 899.148 [82.302], Avg: 714.881 (0.0200) <0-09:26:13> 
+Step:  442000, Reward: 901.36 [23.290], Avg: 715.302 (0.0200) <0-09:27:30> 
+Step:  443000, Reward: 894.578 [21.994], Avg: 715.706 (0.0200) <0-09:28:47> 
+Step:  444000, Reward: 918.496 [13.281], Avg: 716.161 (0.0200) <0-09:30:04> 
+Step:  445000, Reward: 909.177 [14.985], Avg: 716.594 (0.0200) <0-09:31:21> 
+Step:  446000, Reward: 913.815 [13.627], Avg: 717.035 (0.0200) <0-09:32:37> 
+Step:  447000, Reward: 878.938 [58.504], Avg: 717.397 (0.0200) <0-09:33:54> 
+Step:  448000, Reward: 836.319 [179.935], Avg: 717.662 (0.0200) <0-09:35:12> 
+Step:  449000, Reward: 838.139 [115.469], Avg: 717.929 (0.0200) <0-09:36:29> 
+Step:  450000, Reward: 875.319 [57.237], Avg: 718.278 (0.0200) <0-09:37:47> 
+Step:  451000, Reward: 903.422 [15.221], Avg: 718.688 (0.0200) <0-09:39:05> 
+Step:  452000, Reward: 910.09 [21.372], Avg: 719.11 (0.0200) <0-09:40:21> 
+Step:  453000, Reward: 895.323 [32.321], Avg: 719.499 (0.0200) <0-09:41:40> 
+Step:  454000, Reward: 896.618 [32.573], Avg: 719.888 (0.0200) <0-09:42:58> 
+Step:  455000, Reward: 881.804 [79.792], Avg: 720.243 (0.0200) <0-09:44:16> 
+Step:  456000, Reward: 860.822 [30.528], Avg: 720.55 (0.0200) <0-09:45:33> 
+Step:  457000, Reward: 863.821 [82.152], Avg: 720.863 (0.0200) <0-09:46:50> 
+Step:  458000, Reward: 849.357 [123.259], Avg: 721.143 (0.0200) <0-09:48:07> 
+Step:  459000, Reward: 827.919 [142.882], Avg: 721.375 (0.0200) <0-09:49:25> 
+Step:  460000, Reward: 868.855 [66.938], Avg: 721.695 (0.0200) <0-09:50:42> 
+Step:  461000, Reward: 766.546 [181.915], Avg: 721.792 (0.0200) <0-09:51:59> 
+Step:  462000, Reward: 812.365 [112.450], Avg: 721.988 (0.0200) <0-09:53:15> 
+Step:  463000, Reward: 735.051 [230.100], Avg: 722.016 (0.0200) <0-09:54:33> 
+Step:  464000, Reward: 768.926 [190.958], Avg: 722.117 (0.0200) <0-09:55:50> 
+Step:  465000, Reward: 868.537 [93.088], Avg: 722.431 (0.0200) <0-09:57:07> 
+Step:  466000, Reward: 802.492 [214.395], Avg: 722.603 (0.0200) <0-09:58:23> 
+Step:  467000, Reward: 887.766 [46.333], Avg: 722.956 (0.0200) <0-09:59:41> 
+Step:  468000, Reward: 899.714 [17.588], Avg: 723.332 (0.0200) <0-10:00:58> 
+Step:  469000, Reward: 890.459 [29.531], Avg: 723.688 (0.0200) <0-10:02:15> 
+Step:  470000, Reward: 894.439 [21.691], Avg: 724.051 (0.0200) <0-10:03:33> 
+Step:  471000, Reward: 869.311 [120.727], Avg: 724.358 (0.0200) <0-10:04:50> 
+Step:  472000, Reward: 905.895 [18.388], Avg: 724.742 (0.0200) <0-10:06:07> 
+Step:  473000, Reward: 863.099 [72.539], Avg: 725.034 (0.0200) <0-10:07:24> 
+Step:  474000, Reward: 842.979 [105.891], Avg: 725.282 (0.0200) <0-10:08:41> 
+Step:  475000, Reward: 751.032 [81.726], Avg: 725.336 (0.0200) <0-10:09:58> 
+Step:  476000, Reward: 859.341 [97.733], Avg: 725.617 (0.0200) <0-10:11:15> 
+Step:  477000, Reward: 821.563 [156.185], Avg: 725.818 (0.0200) <0-10:12:32> 
+Step:  478000, Reward: 773.585 [186.123], Avg: 725.918 (0.0200) <0-10:13:49> 
+Step:  479000, Reward: 896.879 [19.598], Avg: 726.274 (0.0200) <0-10:15:06> 
+Step:  480000, Reward: 852.385 [90.777], Avg: 726.536 (0.0200) <0-10:16:22> 
+Step:  481000, Reward: 894.595 [18.455], Avg: 726.885 (0.0200) <0-10:17:40> 
+Step:  482000, Reward: 799.756 [193.661], Avg: 727.036 (0.0200) <0-10:18:58> 
+Step:  483000, Reward: 847.962 [58.542], Avg: 727.286 (0.0200) <0-10:20:15> 
+Step:  484000, Reward: 860.176 [97.593], Avg: 727.56 (0.0200) <0-10:21:31> 
+Step:  485000, Reward: 825.154 [160.363], Avg: 727.76 (0.0200) <0-10:22:48> 
+Step:  486000, Reward: 742.255 [162.681], Avg: 727.79 (0.0200) <0-10:24:06> 
+Step:  487000, Reward: 811.88 [119.551], Avg: 727.962 (0.0200) <0-10:25:23> 
+Step:  488000, Reward: 876.82 [29.877], Avg: 728.267 (0.0200) <0-10:26:39> 
+Step:  489000, Reward: 879.113 [87.298], Avg: 728.575 (0.0200) <0-10:27:57> 
+Step:  490000, Reward: 852.318 [55.156], Avg: 728.827 (0.0200) <0-10:29:14> 
+Step:  491000, Reward: 911.261 [18.026], Avg: 729.198 (0.0200) <0-10:30:31> 
+Step:  492000, Reward: 899.992 [30.151], Avg: 729.544 (0.0200) <0-10:31:49> 
+Step:  493000, Reward: 828.735 [155.490], Avg: 729.745 (0.0200) <0-10:33:05> 
+Step:  494000, Reward: 870.715 [44.062], Avg: 730.03 (0.0200) <0-10:34:22> 
+Step:  495000, Reward: 849.919 [107.419], Avg: 730.271 (0.0200) <0-10:35:39> 
+Step:  496000, Reward: 881.554 [49.895], Avg: 730.576 (0.0200) <0-10:36:56> 
+Step:  497000, Reward: 883.989 [21.272], Avg: 730.884 (0.0200) <0-10:38:14> 
+Step:  498000, Reward: 823.263 [164.756], Avg: 731.069 (0.0200) <0-10:39:31> 
+Step:  499000, Reward: 897.636 [25.544], Avg: 731.402 (0.0200) <0-10:40:48> 
+Step:  500000, Reward: 893.869 [20.933], Avg: 731.726 (0.0200) <0-10:42:06> 

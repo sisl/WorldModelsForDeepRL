@@ -1,0 +1,240 @@
+Agent: <class 'models.controller.Controller'>, Dir: pytorch
+
+popsize: 18, restarts: 4,
+import os
+import torch
+import numpy as np
+from utils.envs import WorldModel
+from models.rand import RandomAgent
+from models.vae import LATENT_SIZE
+from models.mdrnn import HIDDEN_SIZE, ACTION_SIZE
+
+class ControlActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.linear = torch.nn.Linear(state_size[-1], *action_size)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) == torch.nn.Linear else None)
+
+	def forward(self, state):
+		action = self.linear(state)
+		return action
+
+class Controller():
+	def __init__(self, state_size=[LATENT_SIZE+HIDDEN_SIZE], action_size=[ACTION_SIZE], gpu=True, load=""):
+		super().__init__()
+		self.device = torch.device('cuda' if gpu and torch.cuda.is_available() else 'cpu')
+		self.actor_local = ControlActor(state_size, action_size).to(self.device)
+		if load: self.load_model(load)
+
+	def get_action(self, state):
+		with torch.no_grad():
+			action = self.actor_local(state.to(self.device)).clamp(-1, 1)
+			return action.cpu().numpy()
+
+	def get_params(self):
+		params = [p.view(-1) for p in self.actor_local.parameters()]
+		params = torch.cat(params, dim=0)
+		return params.cpu().detach().numpy()
+
+	def set_params(self, params):
+		numels = [p.numel() for p in self.actor_local.parameters()]
+		starts = np.cumsum([0] + numels)
+		params = [params[s:starts[i+1]] for i,s in enumerate(starts[:-1])]
+		for p,d in zip(self.actor_local.parameters(), params):
+			p.data.copy_(torch.Tensor(d).view(p.size()))
+		return self
+
+	def save_model(self, dirname="pytorch", name="best"):
+		filepath = get_checkpoint_path(dirname, name)
+		os.makedirs(os.path.dirname(filepath), exist_ok=True)
+		torch.save(self.actor_local.state_dict(), filepath)
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		filepath = get_checkpoint_path(dirname, name)
+		if os.path.exists(filepath):
+			self.actor_local.load_state_dict(torch.load(filepath))
+		return self
+
+class ControlAgent(RandomAgent):
+	def __init__(self, action_size, gpu=True, load=""):
+		super().__init__(action_size)
+		self.world_model = WorldModel(action_size, num_envs=1, load=load, gpu=gpu)
+		self.network = Controller(self.world_model.state_size, action_size, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True):
+		state, self.latent = self.world_model.get_state(state, numpy=False)
+		action = self.network.get_action(state)
+		return action
+
+	def get_env_action(self, env, state, eps=None):
+		env_action, action = super().get_env_action(env, state, eps)
+		self.world_model.step(self.latent, env_action)
+		return env_action, action
+
+	def set_params(self, params):
+		self.network.set_params(params)
+		return self
+
+	def save_model(self, dirname="pytorch", name="best"):
+		self.network.save_model(dirname, name)
+
+	def load_model(self, dirname="pytorch", name="best"):
+		self.world_model.load_model(dirname, name)
+		self.network.load_model(dirname, name)
+		return self
+
+def get_checkpoint_path(dirname="pytorch", name="best"):
+	return f"./saved_models/ctrl/{dirname}/{name}.pth"
+
+Ep: 0-61, Best score: -16.8080, Min: -47.9083, Avg: -35.7895
+Ep: 0-60, Best score: -26.2874, Min: -46.1391, Avg: -36.6878
+Ep: 0-59, Best score: -18.8134, Min: -47.9128, Avg: -32.6809
+Ep: 0-58, Best score: -23.4050, Min: -38.8173, Avg: -31.1205
+Ep: 0-57, Best score: -21.8038, Min: -40.1417, Avg: -29.2351
+Ep: 0-56, Best score: -19.2316, Min: -55.4299, Avg: -31.2357
+Ep: 0-55, Best score: -19.4108, Min: -44.0836, Avg: -30.4847
+Ep: 0-54, Best score: -24.4148, Min: -45.6996, Avg: -31.6065
+Ep: 0-53, Best score: -20.5241, Min: -37.6477, Avg: -30.1482
+Ep: 0-52, Best score: -12.6010, Min: -39.8017, Avg: -25.5728
+Ep: 0-51, Best score: -19.6103, Min: -60.3960, Avg: -29.5203
+Ep: 0-50, Best score: -17.3202, Min: -41.9984, Avg: -26.5101
+Ep: 0-49, Best score: -17.5157, Min: -45.2759, Avg: -32.8770
+Ep: 0-48, Best score: -18.5127, Min: -57.2550, Avg: -33.5513
+Ep: 0-47, Best score: -17.3911, Min: -40.8685, Avg: -30.1249
+Ep: 0-46, Best score: -19.0921, Min: -54.4261, Avg: -35.1291
+Ep: 0-45, Best score: -21.5493, Min: -54.8876, Avg: -34.9249
+Ep: 0-44, Best score: -22.5329, Min: -50.3794, Avg: -38.5787
+Ep: 0-43, Best score: -22.8796, Min: -55.8692, Avg: -37.2125
+Ep: 0-42, Best score: -26.0401, Min: -47.3123, Avg: -37.1125
+Ep: 0-41, Best score: -15.5100, Min: -52.9331, Avg: -34.2533
+Ep: 0-40, Best score: -21.4616, Min: -54.8223, Avg: -35.7930
+Ep: 0-39, Best score: -20.3999, Min: -50.3768, Avg: -33.3936
+Ep: 0-38, Best score: -19.2577, Min: -49.4615, Avg: -33.7190
+Ep: 0-37, Best score: -21.4606, Min: -54.4055, Avg: -32.9482
+Ep: 0-36, Best score: -20.8618, Min: -56.0063, Avg: -35.2539
+Ep: 0-35, Best score: -19.6751, Min: -57.2967, Avg: -37.4528
+Ep: 0-34, Best score: -28.6899, Min: -48.0303, Avg: -35.1075
+Ep: 0-33, Best score: -24.0969, Min: -51.6132, Avg: -37.0991
+Ep: 0-32, Best score: -10.0041, Min: -59.3974, Avg: -33.8067
+Ep: 0-31, Best score: -21.4796, Min: -54.3283, Avg: -31.4722
+Ep: 0-30, Best score: -20.4530, Min: -52.9456, Avg: -35.6253
+Ep: 0-29, Best score: -16.6774, Min: -48.3128, Avg: -29.0808
+Ep: 0-28, Best score: -19.2692, Min: -40.0942, Avg: -30.0261
+Ep: 0-27, Best score: -17.1534, Min: -49.6534, Avg: -34.8857
+Ep: 0-26, Best score: -18.8319, Min: -49.9861, Avg: -32.6730
+Ep: 0-25, Best score: -18.9608, Min: -46.9421, Avg: -34.3383
+Ep: 0-24, Best score: -18.4263, Min: -48.5025, Avg: -30.5258
+Ep: 0-23, Best score: -19.1182, Min: -51.4586, Avg: -34.5057
+Ep: 0-22, Best score: -19.5356, Min: -54.6598, Avg: -33.1143
+Ep: 0-21, Best score: -16.6741, Min: -42.0324, Avg: -32.3343
+Ep: 0-20, Best score: -21.6004, Min: -50.5765, Avg: -32.2025
+Ep: 0-19, Best score: -18.4300, Min: -49.4228, Avg: -32.7865
+Ep: 0-18, Best score: -23.2782, Min: -49.1046, Avg: -33.8150
+Ep: 0-17, Best score: -16.0675, Min: -53.5207, Avg: -33.6057
+Ep: 0-16, Best score: -23.7671, Min: -48.6388, Avg: -33.6322
+Ep: 0-15, Best score: -22.1711, Min: -47.6922, Avg: -33.6801
+Ep: 0-14, Best score: -21.2426, Min: -45.4348, Avg: -34.3263
+Ep: 0-13, Best score: -22.7273, Min: -48.4930, Avg: -33.9067
+Ep: 0-12, Best score: -26.0965, Min: -45.9074, Avg: -34.1076
+Ep: 0-11, Best score: -20.3530, Min: -42.4313, Avg: -33.4891
+Ep: 0-10, Best score: -17.3405, Min: -54.0475, Avg: -36.7618
+Ep: 0-9, Best score: -24.9698, Min: -48.2164, Avg: -35.7458
+Ep: 0-8, Best score: -22.8453, Min: -44.2226, Avg: -33.6940
+Ep: 0-7, Best score: -26.5174, Min: -64.6895, Avg: -40.8462
+Ep: 0-6, Best score: -29.0685, Min: -56.0237, Avg: -38.0316
+Ep: 0-5, Best score: -18.7466, Min: -54.4578, Avg: -35.5591
+Ep: 0-4, Best score: -25.5229, Min: -54.8485, Avg: -38.7548
+Ep: 0-3, Best score: -15.4301, Min: -56.9109, Avg: -36.3582
+Ep: 0-2, Best score: -20.4114, Min: -49.7620, Avg: -36.3862
+Ep: 0-1, Best score: -25.4208, Min: -54.6560, Avg: -40.2489
+Ep: 0-0, Best score: -24.1104, Min: -60.9941, Avg: -38.4619
+Ep: 1-61, Best score: -20.7584, Min: -63.2347, Avg: -40.9986
+Ep: 1-60, Best score: -22.1241, Min: -65.4948, Avg: -44.7513
+Ep: 1-59, Best score: -18.9009, Min: -61.3352, Avg: -41.2007
+Ep: 1-58, Best score: -24.8843, Min: -61.9867, Avg: -39.7369
+Ep: 1-57, Best score: -18.0302, Min: -54.7758, Avg: -33.3674
+Ep: 1-56, Best score: -23.1329, Min: -60.2675, Avg: -38.1404
+Ep: 1-55, Best score: -18.0877, Min: -47.9867, Avg: -32.7932
+Ep: 1-54, Best score: -15.9244, Min: -62.6212, Avg: -37.3585
+Ep: 1-53, Best score: -25.9125, Min: -54.1733, Avg: -35.8434
+Ep: 1-52, Best score: -23.8087, Min: -55.8081, Avg: -40.9199
+Ep: 1-51, Best score: -16.2376, Min: -60.1620, Avg: -32.6643
+Ep: 1-50, Best score: -16.7468, Min: -59.3085, Avg: -33.6449
+Ep: 1-49, Best score: -21.7272, Min: -55.9905, Avg: -39.1216
+Ep: 1-48, Best score: -20.5640, Min: -59.4705, Avg: -34.7322
+Ep: 1-47, Best score: -20.7981, Min: -61.8686, Avg: -40.6140
+Ep: 1-46, Best score: -16.5137, Min: -64.7019, Avg: -37.1392
+Ep: 1-45, Best score: -21.0366, Min: -55.9036, Avg: -35.0541
+Ep: 1-44, Best score: -26.7380, Min: -56.1534, Avg: -38.8464
+Ep: 1-43, Best score: -26.7359, Min: -61.9779, Avg: -40.6506
+Ep: 1-42, Best score: -24.5271, Min: -58.5823, Avg: -38.1316
+Ep: 1-41, Best score: -20.8559, Min: -64.0721, Avg: -36.0625
+Ep: 1-40, Best score: -27.1631, Min: -43.7604, Avg: -36.9404
+Ep: 1-39, Best score: -25.9553, Min: -58.9380, Avg: -36.8863
+Ep: 1-38, Best score: -24.4651, Min: -43.1384, Avg: -32.5679
+Ep: 1-37, Best score: -19.3558, Min: -61.9294, Avg: -39.8522
+Ep: 1-36, Best score: -23.0771, Min: -54.0323, Avg: -35.8711
+Ep: 1-35, Best score: -16.5161, Min: -47.9861, Avg: -30.8602
+Ep: 1-34, Best score: -23.6767, Min: -47.0222, Avg: -32.4228
+Ep: 1-33, Best score: -29.4191, Min: -48.0487, Avg: -36.3573
+Ep: 1-32, Best score: -27.0051, Min: -56.0925, Avg: -38.1179
+Ep: 1-31, Best score: -27.2336, Min: -54.9461, Avg: -38.2492
+Ep: 1-30, Best score: -25.5340, Min: -57.5343, Avg: -38.2948
+Ep: 1-29, Best score: -24.7521, Min: -61.2466, Avg: -38.0469
+Ep: 1-28, Best score: -22.8150, Min: -50.8298, Avg: -37.0341
+Ep: 1-27, Best score: -23.8896, Min: -54.8684, Avg: -35.5171
+Ep: 1-26, Best score: -22.2419, Min: -57.7684, Avg: -37.9140
+Ep: 1-25, Best score: -21.2735, Min: -50.6443, Avg: -33.7020
+Ep: 1-24, Best score: -24.4906, Min: -57.7591, Avg: -38.2418
+Ep: 1-23, Best score: -23.8621, Min: -59.5103, Avg: -40.2405
+Ep: 1-22, Best score: -24.1945, Min: -54.1275, Avg: -37.9283
+Ep: 1-21, Best score: -30.1563, Min: -56.4671, Avg: -39.4557
+Ep: 1-20, Best score: -23.6598, Min: -52.1374, Avg: -39.3061
+Ep: 1-19, Best score: -25.9425, Min: -62.0642, Avg: -38.8632
+Ep: 1-18, Best score: -22.9228, Min: -56.5658, Avg: -41.5477
+Ep: 1-17, Best score: -20.8569, Min: -48.6602, Avg: -35.0256
+Ep: 1-16, Best score: -16.6225, Min: -52.9103, Avg: -36.3793
+Ep: 1-15, Best score: -22.7926, Min: -60.2841, Avg: -38.0379
+Ep: 1-14, Best score: -17.2362, Min: -57.1345, Avg: -36.3899
+Ep: 1-13, Best score: -18.7643, Min: -62.1107, Avg: -42.0293
+Ep: 1-12, Best score: -25.9860, Min: -61.0495, Avg: -42.9558
+Ep: 1-11, Best score: -23.7231, Min: -46.6725, Avg: -36.1794
+Ep: 1-10, Best score: -27.1349, Min: -54.5050, Avg: -37.5278
+Ep: 1-9, Best score: -25.2854, Min: -56.8153, Avg: -38.8895
+Ep: 1-8, Best score: -22.3170, Min: -58.8790, Avg: -38.5803
+Ep: 1-7, Best score: -19.3189, Min: -56.6485, Avg: -37.2586
+Ep: 1-6, Best score: -25.0389, Min: -69.5013, Avg: -39.6541
+Ep: 1-5, Best score: -26.2556, Min: -54.5731, Avg: -38.9130
+Ep: 1-4, Best score: -24.9514, Min: -61.9698, Avg: -39.6215
+Ep: 1-3, Best score: -26.2008, Min: -58.0868, Avg: -40.6795
+Ep: 1-2, Best score: -18.0994, Min: -56.0205, Avg: -38.0069
+Ep: 1-1, Best score: -23.1814, Min: -49.5337, Avg: -38.8532
+Ep: 1-0, Best score: -24.7673, Min: -54.3822, Avg: -39.5475
+Ep: 2-61, Best score: -15.5352, Min: -63.3511, Avg: -42.3536
+Ep: 2-60, Best score: -19.1768, Min: -60.6357, Avg: -35.3685
+Ep: 2-59, Best score: -21.1401, Min: -59.2382, Avg: -39.7628
+Ep: 2-58, Best score: -23.3445, Min: -46.9841, Avg: -34.8102
+Ep: 2-57, Best score: -23.2278, Min: -54.1819, Avg: -32.8719
+Ep: 2-56, Best score: -28.7761, Min: -46.7133, Avg: -35.4654
+Ep: 2-55, Best score: -19.2634, Min: -45.0859, Avg: -35.0899
+Ep: 2-54, Best score: -18.5595, Min: -50.9940, Avg: -38.8568
+Ep: 2-53, Best score: -23.1385, Min: -51.3111, Avg: -38.1599
+Ep: 2-52, Best score: -22.9811, Min: -57.9107, Avg: -39.1526
+Ep: 2-51, Best score: -24.7559, Min: -60.7693, Avg: -36.7021
+Ep: 2-50, Best score: -27.7679, Min: -56.5964, Avg: -37.2017
+Ep: 2-49, Best score: -24.2642, Min: -53.5627, Avg: -37.4483
+Ep: 2-48, Best score: -21.5297, Min: -39.7040, Avg: -33.4023
+Ep: 2-47, Best score: -27.3861, Min: -51.0345, Avg: -38.3875
+Ep: 2-46, Best score: -21.9328, Min: -50.1496, Avg: -36.8069
+Ep: 2-45, Best score: -25.4415, Min: -42.7725, Avg: -34.5871
+Ep: 2-44, Best score: -23.4897, Min: -50.2684, Avg: -35.5023
+Ep: 2-43, Best score: -31.2136, Min: -52.4642, Avg: -40.0451
+Ep: 2-42, Best score: -24.1172, Min: -53.6932, Avg: -33.8872
+Ep: 2-41, Best score: -23.2224, Min: -62.1496, Avg: -37.7397
+Ep: 2-40, Best score: -25.0289, Min: -56.9820, Avg: -37.0885
+Ep: 2-39, Best score: -23.2782, Min: -53.8446, Avg: -35.0763
+Ep: 2-38, Best score: -23.9694, Min: -49.4945, Avg: -33.8869
+Ep: 2-37, Best score: -30.1400, Min: -64.1987, Avg: -41.3393
+Ep: 2-36, Best score: -19.8960, Min: -56.2318, Avg: -40.0035
+Ep: 2-35, Best score: -23.8196, Min: -55.1221, Avg: -34.7162
+Ep: 2-34, Best score: -31.0041, Min: -52.6414, Avg: -40.4389

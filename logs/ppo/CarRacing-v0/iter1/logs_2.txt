@@ -1,0 +1,384 @@
+Agent: <class 'models.ppo.PPOAgent'>, Dir: iter1/
+
+import gym
+import torch
+import pickle
+import argparse
+import numpy as np
+from models.rand import ReplayBuffer, PrioritizedReplayBuffer
+from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN
+
+LEARN_RATE = 0.0001
+EPS_MIN = 0.2                 # The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.997             # The rate at which eps decays from EPS_MAX to EPS_MIN
+BATCH_SIZE = 5
+PPO_EPOCHS = 4
+ENTROPY_WEIGHT = 0.005
+CLIP_PARAM = 0.005
+
+class PPOActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, *action_size)
+		self.action_sig = torch.nn.Parameter(torch.zeros(*action_size))
+		# self.action_sig = torch.nn.Linear(ACTOR_HIDDEN, *action_size)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		
+	def forward(self, state, action=None, sample=True):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		action_mu = self.action_mu(state)
+		action_sig = self.action_sig.exp().expand_as(action_mu)
+		# action_sig = self.action_sig(state).exp()
+		dist = torch.distributions.Normal(action_mu, action_sig)
+		action = action_mu if not sample else dist.sample() if action is None else action
+		log_prob = dist.log_prob(action)
+		entropy = dist.entropy()
+		return action, log_prob, entropy
+
+class PPOCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu() + state
+		value = self.value(state)
+		return value
+
+class PPONetwork(PTACNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPOActor, PPOCritic, lr=lr, gpu=gpu, load=load)
+
+	def get_action_probs(self, state, action_in=None, sample=True, grad=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action, log_prob, entropy = self.actor_local(state.to(self.device), action_in, sample)
+			return action if action_in is None else entropy.mean(), log_prob
+
+	def get_value(self, state, grad=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			value = self.critic_local(state.to(self.device))
+			return value
+
+	def optimize(self, states, actions, old_log_probs, targets, advantages, importances=1, clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT):
+		values = self.get_value(states)
+		critic_error = values - targets
+		critic_loss = importances.to(self.device) + critic_error.pow(2)
+		self.step(self.critic_optimizer, critic_loss.mean())
+
+		entropy, new_log_probs = self.get_action_probs(states, actions)
+		ratio = (new_log_probs - old_log_probs).exp()
+		ratio_clipped = torch.clamp(ratio, 1.0-clip_param, 1.0+clip_param)
+		actor_loss = -(torch.min(ratio*advantages, ratio_clipped*advantages).mean() + e_weight*entropy)
+		self.step(self.actor_optimizer, actor_loss)
+		return critic_error.cpu().detach().numpy().squeeze(-1)
+
+	def save_model(self, dirname="pytorch", name="best"):
+		super().save_model("ppo", dirname, name)
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		super().load_model("ppo", dirname, name)
+
+class PPOAgent(PTACAgent):
+	def __init__(self, state_size, action_size, decay=EPS_DECAY, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPONetwork, lr=lr, decay=decay, gpu=gpu, load=load)
+		self.replay_buffer = PrioritizedReplayBuffer()
+		self.ppo_epochs = PPO_EPOCHS
+		self.ppo_batch = BATCH_SIZE
+
+	def get_action(self, state, eps=None, sample=True):
+		state = self.to_tensor(state)
+		self.action, self.log_prob = [x.cpu().numpy() for x in self.network.get_action_probs(state, sample=sample, grad=False)]
+		return np.tanh(self.action)
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, self.action, self.log_prob, reward, done))
+		if len(self.buffer) == self.update_freq:
+			states, actions, log_probs, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+			self.buffer.clear()
+			next_state = self.to_tensor(next_state)
+			values = self.network.get_value(states, grad=False)
+			next_value = self.network.get_value(next_state, grad=False)
+			targets, advantages = self.compute_gae(next_value, rewards.unsqueeze(-1), dones.unsqueeze(-1), values)
+			states, actions, log_probs, targets, advantages = [x.view(x.size(0)*x.size(1), *x.size()[2:]) for x in (states, actions, log_probs, targets, advantages)]
+			self.replay_buffer.clear().extend(zip(states, actions, log_probs, targets, advantages))
+			for _ in range(self.ppo_epochs*states.size(0)//self.ppo_batch):
+				(states, actions, log_probs, targets, advantages), indices, importances = self.replay_buffer.sample(self.ppo_batch, dtype=torch.stack)
+				errors = self.network.optimize(states, actions, log_probs, targets, advantages, importances**(1-self.eps))#, CLIP_PARAM*self.eps, ENTROPY_WEIGHT*self.eps)
+				self.replay_buffer.update_priorities(indices, errors)
+		if done[0]: self.eps = max(self.eps * self.decay, EPS_MIN)
+
+REG_LAMBDA = 1e-6             # Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           # Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   # How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512
+ACTOR_HIDDEN = 256
+CRITIC_HIDDEN = 1024
+DISCOUNT_RATE = 0.97
+NUM_STEPS = 20
+EPS_MAX = 1.0                 # The starting proportion of random to greedy actions to take
+EPS_MIN = 0.1                 # The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.995             # The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.99
+MAX_BUFFER_SIZE = 100000      # Sets the maximum length of the replay buffer
+
+Ep: 0, Reward: -42.9040, Test: -24.1999 [15.11], Avg: -39.3050 (0.997)
+Ep: 1, Reward: -36.7412, Test: -16.6625 [17.74], Avg: -36.8561 (0.994)
+Ep: 2, Reward: -33.0276, Test: -24.7803 [8.13], Avg: -35.5410 (0.991)
+Ep: 3, Reward: -30.6419, Test: -16.7023 [16.64], Avg: -34.9909 (0.988)
+Ep: 4, Reward: -24.6663, Test: -25.3009 [2.92], Avg: -33.6366 (0.985)
+Ep: 5, Reward: -24.1511, Test: 2.2271 [37.23], Avg: -33.8638 (0.982)
+Ep: 6, Reward: -21.9199, Test: -21.7487 [36.02], Avg: -37.2793 (0.979)
+Ep: 7, Reward: -27.0995, Test: -39.2932 [14.49], Avg: -39.3427 (0.976)
+Ep: 8, Reward: -32.9747, Test: -39.4792 [54.03], Avg: -45.3614 (0.973)
+Ep: 9, Reward: -45.8345, Test: -38.2633 [25.54], Avg: -47.2058 (0.970)
+Ep: 10, Reward: -52.0481, Test: -56.2970 [43.34], Avg: -51.9727 (0.967)
+Ep: 11, Reward: -52.1653, Test: -49.1751 [34.19], Avg: -54.5891 (0.965)
+Ep: 12, Reward: -45.2046, Test: -46.9309 [37.96], Avg: -56.9200 (0.962)
+Ep: 13, Reward: -41.3026, Test: -5.7548 [20.51], Avg: -54.7302 (0.959)
+Ep: 14, Reward: -37.8185, Test: -40.5500 [25.09], Avg: -55.4577 (0.956)
+Ep: 15, Reward: -29.4456, Test: -55.5372 [11.60], Avg: -56.1875 (0.953)
+Ep: 16, Reward: -33.0974, Test: -53.6784 [13.24], Avg: -56.8189 (0.950)
+Ep: 17, Reward: -44.1966, Test: -60.8822 [14.81], Avg: -57.8675 (0.947)
+Ep: 18, Reward: -31.0771, Test: -63.2514 [10.31], Avg: -58.6934 (0.945)
+Ep: 19, Reward: -35.3090, Test: -51.6491 [17.07], Avg: -59.1948 (0.942)
+Ep: 20, Reward: -51.0061, Test: -61.8002 [12.60], Avg: -59.9190 (0.939)
+Ep: 21, Reward: -37.1407, Test: -67.4213 [4.86], Avg: -60.4808 (0.936)
+Ep: 22, Reward: -50.9012, Test: -71.8014 [4.54], Avg: -61.1704 (0.933)
+Ep: 23, Reward: -39.2029, Test: -72.8134 [2.35], Avg: -61.7534 (0.930)
+Ep: 24, Reward: -34.5720, Test: -71.1846 [3.22], Avg: -62.2594 (0.928)
+Ep: 25, Reward: -38.2807, Test: -72.2438 [2.98], Avg: -62.7579 (0.925)
+Ep: 26, Reward: -19.1435, Test: 249.8524 [158.37], Avg: -57.0453 (0.922)
+Ep: 27, Reward: 2.8628, Test: 162.6235 [124.33], Avg: -53.6401 (0.919)
+Ep: 28, Reward: 32.5444, Test: 282.5858 [97.30], Avg: -45.4013 (0.917)
+Ep: 29, Reward: 153.0832, Test: 208.2168 [106.50], Avg: -40.4973 (0.914)
+Ep: 30, Reward: 290.8160, Test: 214.3588 [117.11], Avg: -36.0540 (0.911)
+Ep: 31, Reward: 325.6402, Test: 179.2661 [108.45], Avg: -32.7144 (0.908)
+Ep: 32, Reward: 384.0037, Test: 214.4642 [120.96], Avg: -28.8896 (0.906)
+Ep: 33, Reward: 504.7789, Test: 157.1504 [123.01], Avg: -27.0357 (0.903)
+Ep: 34, Reward: 541.7721, Test: 175.4434 [88.18], Avg: -23.7699 (0.900)
+Ep: 35, Reward: 660.8551, Test: 168.5985 [122.97], Avg: -21.8420 (0.897)
+Ep: 36, Reward: 651.6104, Test: 96.6748 [92.16], Avg: -21.1296 (0.895)
+Ep: 37, Reward: 624.4652, Test: 159.1060 [108.23], Avg: -19.2348 (0.892)
+Ep: 38, Reward: 588.0969, Test: 197.8323 [108.09], Avg: -16.4406 (0.889)
+Ep: 39, Reward: 710.7850, Test: 166.0946 [122.51], Avg: -14.9400 (0.887)
+Ep: 40, Reward: 670.6494, Test: 101.0516 [87.22], Avg: -14.2382 (0.884)
+Ep: 41, Reward: 510.6315, Test: 143.1426 [89.68], Avg: -12.6263 (0.881)
+Ep: 42, Reward: 490.9386, Test: 179.3875 [96.99], Avg: -10.4165 (0.879)
+Ep: 43, Reward: 385.7267, Test: 106.4561 [83.81], Avg: -9.6650 (0.876)
+Ep: 44, Reward: 428.0819, Test: 79.4070 [83.09], Avg: -9.5322 (0.874)
+Ep: 45, Reward: 332.5183, Test: 85.3869 [61.13], Avg: -8.7977 (0.871)
+Ep: 46, Reward: 222.8183, Test: 32.8850 [56.45], Avg: -9.1120 (0.868)
+Ep: 47, Reward: 246.5498, Test: 119.7473 [91.96], Avg: -8.3432 (0.866)
+Ep: 48, Reward: 198.2557, Test: 87.9356 [93.09], Avg: -8.2781 (0.863)
+Ep: 49, Reward: 264.4501, Test: 76.9507 [74.33], Avg: -8.0601 (0.861)
+Ep: 50, Reward: 246.1653, Test: 72.7830 [71.76], Avg: -7.8821 (0.858)
+Ep: 51, Reward: 224.4562, Test: 103.5366 [95.17], Avg: -7.5697 (0.855)
+Ep: 52, Reward: 269.9622, Test: 92.7733 [87.24], Avg: -7.3225 (0.853)
+Ep: 53, Reward: 303.3861, Test: 164.7919 [93.47], Avg: -5.8662 (0.850)
+Ep: 54, Reward: 339.7204, Test: 168.2549 [96.57], Avg: -4.4562 (0.848)
+Ep: 55, Reward: 323.8547, Test: 203.9650 [63.96], Avg: -1.8765 (0.845)
+Ep: 56, Reward: 393.8670, Test: 186.6867 [113.72], Avg: -0.5635 (0.843)
+Ep: 57, Reward: 418.7179, Test: 152.3635 [105.40], Avg: 0.2559 (0.840)
+Ep: 58, Reward: 437.5079, Test: 227.8817 [88.64], Avg: 2.6117 (0.838)
+Ep: 59, Reward: 372.2328, Test: 203.5046 [121.62], Avg: 3.9328 (0.835)
+Ep: 60, Reward: 364.3410, Test: 201.9933 [93.74], Avg: 5.6431 (0.833)
+Ep: 61, Reward: 409.1497, Test: 183.0724 [118.11], Avg: 6.5999 (0.830)
+Ep: 62, Reward: 461.5836, Test: 220.2740 [102.22], Avg: 8.3689 (0.828)
+Ep: 63, Reward: 542.0524, Test: 254.6492 [90.50], Avg: 10.8031 (0.825)
+Ep: 64, Reward: 540.1700, Test: 206.6595 [107.07], Avg: 12.1691 (0.823)
+Ep: 65, Reward: 538.1810, Test: 163.3224 [107.31], Avg: 12.8334 (0.820)
+Ep: 66, Reward: 511.9427, Test: 197.6160 [122.53], Avg: 13.7625 (0.818)
+Ep: 67, Reward: 527.2763, Test: 223.2110 [97.04], Avg: 15.4156 (0.815)
+Ep: 68, Reward: 567.4042, Test: 268.1385 [97.14], Avg: 17.6705 (0.813)
+Ep: 69, Reward: 576.0316, Test: 268.3789 [86.62], Avg: 20.0145 (0.810)
+Ep: 70, Reward: 551.9882, Test: 330.8051 [124.02], Avg: 22.6451 (0.808)
+Ep: 71, Reward: 566.9876, Test: 175.0157 [126.28], Avg: 23.0074 (0.805)
+Ep: 72, Reward: 572.4824, Test: 144.5798 [105.24], Avg: 23.2312 (0.803)
+Ep: 73, Reward: 520.9442, Test: 274.5570 [114.27], Avg: 25.0833 (0.801)
+Ep: 74, Reward: 558.5360, Test: 267.0719 [129.79], Avg: 26.5793 (0.798)
+Ep: 75, Reward: 522.2446, Test: 321.4103 [107.81], Avg: 29.0402 (0.796)
+Ep: 76, Reward: 413.4092, Test: 194.1959 [112.66], Avg: 29.7219 (0.793)
+Ep: 77, Reward: 532.4760, Test: 220.6792 [132.97], Avg: 30.4653 (0.791)
+Ep: 78, Reward: 437.0863, Test: 205.1939 [134.79], Avg: 30.9709 (0.789)
+Ep: 79, Reward: 519.2341, Test: 181.6495 [127.63], Avg: 31.2591 (0.786)
+Ep: 80, Reward: 525.4890, Test: 203.2667 [122.02], Avg: 31.8762 (0.784)
+Ep: 81, Reward: 465.0593, Test: 197.1351 [102.13], Avg: 32.6460 (0.782)
+Ep: 82, Reward: 588.7552, Test: 280.3438 [62.38], Avg: 34.8787 (0.779)
+Ep: 83, Reward: 505.1359, Test: 185.6071 [103.78], Avg: 35.4377 (0.777)
+Ep: 84, Reward: 410.7376, Test: 179.9253 [99.05], Avg: 35.9722 (0.775)
+Ep: 85, Reward: 540.4114, Test: 194.6779 [92.82], Avg: 36.7382 (0.772)
+Ep: 86, Reward: 440.0302, Test: 219.2424 [131.42], Avg: 37.3255 (0.770)
+Ep: 87, Reward: 342.1640, Test: 194.8343 [71.56], Avg: 38.3021 (0.768)
+Ep: 88, Reward: 344.0195, Test: 194.4041 [53.84], Avg: 39.4511 (0.765)
+Ep: 89, Reward: 317.3990, Test: 153.3223 [104.57], Avg: 39.5545 (0.763)
+Ep: 90, Reward: 247.0856, Test: 200.3984 [109.64], Avg: 40.1172 (0.761)
+Ep: 91, Reward: 348.2650, Test: 95.9761 [86.41], Avg: 39.7851 (0.758)
+Ep: 92, Reward: 396.4467, Test: 230.3794 [84.64], Avg: 40.9244 (0.756)
+Ep: 93, Reward: 331.0871, Test: 235.5317 [138.58], Avg: 41.5204 (0.754)
+Ep: 94, Reward: 407.5212, Test: 189.2830 [86.62], Avg: 42.1640 (0.752)
+Ep: 95, Reward: 363.5426, Test: 221.5444 [86.38], Avg: 43.1328 (0.749)
+Ep: 96, Reward: 299.5677, Test: 173.3757 [107.96], Avg: 43.3625 (0.747)
+Ep: 97, Reward: 277.7289, Test: 353.1003 [201.69], Avg: 44.4650 (0.745)
+Ep: 98, Reward: 403.8466, Test: 199.2411 [127.28], Avg: 44.7427 (0.743)
+Ep: 99, Reward: 437.8187, Test: 283.0644 [154.48], Avg: 45.5811 (0.740)
+Ep: 100, Reward: 380.0090, Test: 263.3326 [70.03], Avg: 47.0437 (0.738)
+Ep: 101, Reward: 442.9984, Test: 209.0029 [73.86], Avg: 47.9074 (0.736)
+Ep: 102, Reward: 446.7505, Test: 337.3281 [178.03], Avg: 48.9889 (0.734)
+Ep: 103, Reward: 513.7247, Test: 274.8031 [60.93], Avg: 50.5744 (0.732)
+Ep: 104, Reward: 496.0819, Test: 288.5170 [102.90], Avg: 51.8606 (0.729)
+Ep: 105, Reward: 368.3730, Test: 242.8079 [105.04], Avg: 52.6710 (0.727)
+Ep: 106, Reward: 379.2636, Test: 270.0656 [207.85], Avg: 52.7603 (0.725)
+Ep: 107, Reward: 403.2763, Test: 283.8903 [84.17], Avg: 54.1210 (0.723)
+Ep: 108, Reward: 315.7446, Test: 219.9615 [94.40], Avg: 54.7764 (0.721)
+Ep: 109, Reward: 349.6557, Test: 229.9095 [65.93], Avg: 55.7691 (0.719)
+Ep: 110, Reward: 322.8485, Test: 272.2042 [99.54], Avg: 56.8222 (0.716)
+Ep: 111, Reward: 340.0623, Test: 245.2119 [95.53], Avg: 57.6514 (0.714)
+Ep: 112, Reward: 282.8957, Test: 221.7124 [97.25], Avg: 58.2426 (0.712)
+Ep: 113, Reward: 273.9735, Test: 319.7559 [96.52], Avg: 59.6900 (0.710)
+Ep: 114, Reward: 355.0479, Test: 221.3320 [90.93], Avg: 60.3049 (0.708)
+Ep: 115, Reward: 394.2578, Test: 254.6195 [170.17], Avg: 60.5130 (0.706)
+Ep: 116, Reward: 376.5327, Test: 252.9234 [159.58], Avg: 60.7936 (0.704)
+Ep: 117, Reward: 433.4951, Test: 236.9822 [134.14], Avg: 61.1499 (0.699)
+Ep: 118, Reward: 397.4015, Test: 264.6561 [156.84], Avg: 61.5421 (0.697)
+Ep: 119, Reward: 464.6847, Test: 287.1626 [116.36], Avg: 62.4526 (0.695)
+Ep: 120, Reward: 399.9210, Test: 337.7358 [160.27], Avg: 63.4031 (0.693)
+Ep: 121, Reward: 430.0016, Test: 290.2558 [102.35], Avg: 64.4236 (0.691)
+Ep: 122, Reward: 480.6868, Test: 347.1223 [162.84], Avg: 65.3981 (0.689)
+Ep: 123, Reward: 514.1181, Test: 449.0035 [193.04], Avg: 66.9349 (0.687)
+Ep: 124, Reward: 489.8845, Test: 441.6400 [206.28], Avg: 68.2823 (0.685)
+Ep: 125, Reward: 507.3479, Test: 464.8447 [120.25], Avg: 70.4752 (0.683)
+Ep: 126, Reward: 544.2799, Test: 296.7296 [124.52], Avg: 71.2763 (0.681)
+Ep: 127, Reward: 418.5112, Test: 354.9138 [168.27], Avg: 72.1776 (0.679)
+Ep: 128, Reward: 525.3034, Test: 524.4034 [180.04], Avg: 74.2876 (0.677)
+Ep: 129, Reward: 581.9354, Test: 509.3108 [170.01], Avg: 76.3261 (0.675)
+Ep: 130, Reward: 607.9025, Test: 443.2964 [182.47], Avg: 77.7345 (0.673)
+Ep: 131, Reward: 619.1905, Test: 612.0903 [140.24], Avg: 80.7203 (0.671)
+Ep: 132, Reward: 594.1951, Test: 537.1050 [157.98], Avg: 82.9639 (0.669)
+Ep: 133, Reward: 628.1949, Test: 666.4390 [129.50], Avg: 86.3518 (0.667)
+Ep: 134, Reward: 680.9857, Test: 526.5155 [164.30], Avg: 88.3952 (0.665)
+Ep: 135, Reward: 644.4310, Test: 585.4268 [177.91], Avg: 90.7417 (0.663)
+Ep: 136, Reward: 660.5534, Test: 616.1435 [139.60], Avg: 93.5578 (0.661)
+Ep: 137, Reward: 618.6370, Test: 522.0324 [221.27], Avg: 95.0593 (0.659)
+Ep: 138, Reward: 515.7967, Test: 514.4919 [232.90], Avg: 96.4012 (0.657)
+Ep: 139, Reward: 605.6334, Test: 490.8084 [170.11], Avg: 98.0033 (0.655)
+Ep: 140, Reward: 675.5306, Test: 522.1824 [190.55], Avg: 99.6602 (0.653)
+Ep: 141, Reward: 597.9971, Test: 604.3668 [148.08], Avg: 102.1717 (0.651)
+Ep: 142, Reward: 522.6794, Test: 510.8419 [192.80], Avg: 103.6813 (0.649)
+Ep: 143, Reward: 517.8393, Test: 430.6100 [174.40], Avg: 104.7405 (0.647)
+Ep: 144, Reward: 598.6729, Test: 445.0871 [239.13], Avg: 105.4386 (0.645)
+Ep: 145, Reward: 537.6970, Test: 616.2970 [218.50], Avg: 107.4410 (0.643)
+Ep: 146, Reward: 565.1419, Test: 473.1628 [139.92], Avg: 108.9771 (0.641)
+Ep: 147, Reward: 600.1240, Test: 435.2132 [188.04], Avg: 109.9108 (0.639)
+Ep: 148, Reward: 657.6782, Test: 497.3038 [190.45], Avg: 111.2326 (0.637)
+Ep: 149, Reward: 493.0811, Test: 432.9322 [202.49], Avg: 112.0273 (0.635)
+Ep: 150, Reward: 558.6630, Test: 415.3880 [154.41], Avg: 113.0137 (0.633)
+Ep: 151, Reward: 386.2705, Test: 506.8847 [160.18], Avg: 114.5512 (0.631)
+Ep: 152, Reward: 513.4095, Test: 480.5980 [182.29], Avg: 115.7522 (0.630)
+Ep: 153, Reward: 596.9185, Test: 492.5218 [196.54], Avg: 116.9225 (0.628)
+Ep: 154, Reward: 496.4534, Test: 527.0494 [179.73], Avg: 118.4090 (0.626)
+Ep: 155, Reward: 563.6099, Test: 462.1144 [144.49], Avg: 119.6860 (0.624)
+Ep: 156, Reward: 596.4577, Test: 493.8551 [142.19], Avg: 121.1635 (0.622)
+Ep: 157, Reward: 540.0725, Test: 535.4136 [160.91], Avg: 122.7669 (0.620)
+Ep: 158, Reward: 619.4380, Test: 432.1757 [186.40], Avg: 123.5406 (0.618)
+Ep: 159, Reward: 541.3488, Test: 493.2292 [171.71], Avg: 124.7780 (0.616)
+Ep: 160, Reward: 462.3382, Test: 481.1593 [164.67], Avg: 125.9687 (0.615)
+Ep: 161, Reward: 630.3897, Test: 515.3745 [131.03], Avg: 127.5636 (0.613)
+Ep: 162, Reward: 532.9957, Test: 517.0744 [171.67], Avg: 128.9000 (0.611)
+Ep: 163, Reward: 648.1154, Test: 471.9493 [184.55], Avg: 129.8665 (0.609)
+Ep: 164, Reward: 609.7687, Test: 563.7470 [198.02], Avg: 131.2960 (0.607)
+Ep: 165, Reward: 598.4369, Test: 596.1998 [208.56], Avg: 132.8402 (0.605)
+Ep: 166, Reward: 582.7622, Test: 686.6993 [106.57], Avg: 135.5186 (0.604)
+Ep: 167, Reward: 578.1534, Test: 549.8183 [219.97], Avg: 136.6753 (0.602)
+Ep: 168, Reward: 600.9758, Test: 694.0867 [162.60], Avg: 139.0114 (0.600)
+Ep: 169, Reward: 734.4174, Test: 604.9538 [105.16], Avg: 141.1337 (0.598)
+Ep: 170, Reward: 634.6183, Test: 720.4560 [89.11], Avg: 144.0005 (0.596)
+Ep: 171, Reward: 767.9674, Test: 641.6459 [172.80], Avg: 145.8891 (0.595)
+Ep: 172, Reward: 610.9665, Test: 661.5969 [155.16], Avg: 147.9732 (0.593)
+Ep: 173, Reward: 577.1699, Test: 578.6617 [224.12], Avg: 149.1604 (0.591)
+Ep: 174, Reward: 629.7735, Test: 690.0288 [125.94], Avg: 151.5314 (0.589)
+Ep: 175, Reward: 709.2076, Test: 646.0061 [202.03], Avg: 153.1930 (0.588)
+Ep: 176, Reward: 701.9673, Test: 752.3662 [124.63], Avg: 155.8741 (0.586)
+Ep: 177, Reward: 599.1539, Test: 665.8917 [175.25], Avg: 157.7548 (0.584)
+Ep: 178, Reward: 653.2966, Test: 523.1267 [203.34], Avg: 158.6600 (0.582)
+Ep: 179, Reward: 526.5910, Test: 533.9233 [175.74], Avg: 159.7685 (0.581)
+Ep: 180, Reward: 677.9998, Test: 636.7458 [224.93], Avg: 161.1610 (0.579)
+Ep: 181, Reward: 607.2341, Test: 759.0234 [77.70], Avg: 164.0191 (0.577)
+Ep: 182, Reward: 718.8045, Test: 705.9054 [154.02], Avg: 166.1386 (0.575)
+Ep: 183, Reward: 678.8004, Test: 632.7029 [191.89], Avg: 167.6313 (0.574)
+Ep: 184, Reward: 676.0163, Test: 635.2878 [232.83], Avg: 168.9007 (0.572)
+Ep: 185, Reward: 725.1633, Test: 607.1667 [197.52], Avg: 170.1950 (0.570)
+Ep: 186, Reward: 635.5290, Test: 597.7731 [207.38], Avg: 171.3726 (0.568)
+Ep: 187, Reward: 620.4590, Test: 685.9361 [178.10], Avg: 173.1623 (0.567)
+Ep: 188, Reward: 597.3393, Test: 633.4494 [208.72], Avg: 174.4933 (0.565)
+Ep: 189, Reward: 713.6102, Test: 610.7356 [209.96], Avg: 175.6843 (0.563)
+Ep: 190, Reward: 660.8889, Test: 683.5692 [136.22], Avg: 177.6302 (0.562)
+Ep: 191, Reward: 656.6184, Test: 628.4946 [210.21], Avg: 178.8836 (0.560)
+Ep: 192, Reward: 699.8294, Test: 769.3790 [139.54], Avg: 181.2201 (0.558)
+Ep: 193, Reward: 664.9649, Test: 653.5859 [195.72], Avg: 182.6461 (0.557)
+Ep: 194, Reward: 808.5702, Test: 632.6392 [146.86], Avg: 184.2007 (0.555)
+Ep: 195, Reward: 610.6256, Test: 689.5542 [129.14], Avg: 186.1201 (0.553)
+Ep: 196, Reward: 824.5721, Test: 715.0963 [163.62], Avg: 187.9747 (0.552)
+Ep: 197, Reward: 690.9752, Test: 740.9759 [169.55], Avg: 189.9113 (0.550)
+Ep: 198, Reward: 796.6172, Test: 614.6036 [293.53], Avg: 190.5704 (0.548)
+Ep: 199, Reward: 792.0164, Test: 747.5493 [192.04], Avg: 192.3951 (0.547)
+Ep: 200, Reward: 687.1264, Test: 793.5335 [141.97], Avg: 194.6795 (0.545)
+Ep: 201, Reward: 873.2006, Test: 764.0167 [173.03], Avg: 196.6414 (0.543)
+Ep: 202, Reward: 847.1343, Test: 735.2678 [231.66], Avg: 198.1536 (0.542)
+Ep: 203, Reward: 893.8591, Test: 830.1553 [92.58], Avg: 200.7978 (0.540)
+Ep: 204, Reward: 828.7310, Test: 868.3390 [55.97], Avg: 203.7811 (0.539)
+Ep: 205, Reward: 888.5484, Test: 870.2612 [28.51], Avg: 206.8780 (0.537)
+Ep: 206, Reward: 822.4992, Test: 824.1864 [79.33], Avg: 209.4770 (0.535)
+Ep: 207, Reward: 811.1878, Test: 623.7053 [314.98], Avg: 209.9541 (0.534)
+Ep: 208, Reward: 806.1685, Test: 881.3971 [19.58], Avg: 213.0731 (0.532)
+Ep: 209, Reward: 827.8288, Test: 863.3482 [65.10], Avg: 215.8596 (0.530)
+Ep: 210, Reward: 902.5630, Test: 718.0821 [209.89], Avg: 217.2451 (0.529)
+Ep: 211, Reward: 839.7220, Test: 892.0866 [21.52], Avg: 220.3268 (0.527)
+Ep: 212, Reward: 757.7029, Test: 867.2459 [59.23], Avg: 223.0859 (0.526)
+Ep: 213, Reward: 843.1304, Test: 879.6727 [24.70], Avg: 226.0386 (0.524)
+Ep: 214, Reward: 815.4597, Test: 779.7768 [190.18], Avg: 227.7296 (0.523)
+Ep: 215, Reward: 776.0277, Test: 836.5117 [71.69], Avg: 230.2161 (0.521)
+Ep: 216, Reward: 853.4908, Test: 877.8956 [62.48], Avg: 232.9129 (0.519)
+Ep: 217, Reward: 820.8185, Test: 807.0036 [156.81], Avg: 234.8270 (0.518)
+Ep: 218, Reward: 864.0817, Test: 783.8208 [157.31], Avg: 236.6155 (0.516)
+Ep: 219, Reward: 834.2550, Test: 749.3826 [239.41], Avg: 237.8580 (0.515)
+Ep: 220, Reward: 828.0296, Test: 846.5286 [89.72], Avg: 240.2062 (0.513)
+Ep: 221, Reward: 834.3684, Test: 835.9620 [113.59], Avg: 242.3781 (0.512)
+Ep: 222, Reward: 859.6938, Test: 802.9801 [175.01], Avg: 244.1073 (0.510)
+Ep: 223, Reward: 833.4261, Test: 779.8978 [116.49], Avg: 245.9791 (0.509)
+Ep: 224, Reward: 753.3853, Test: 789.4893 [104.08], Avg: 247.9322 (0.507)
+Ep: 225, Reward: 626.6955, Test: 730.0768 [199.35], Avg: 249.1835 (0.506)
+Ep: 226, Reward: 840.9275, Test: 816.9020 [80.42], Avg: 251.3301 (0.504)
+Ep: 227, Reward: 813.4311, Test: 705.5052 [188.17], Avg: 252.4968 (0.503)
+Ep: 228, Reward: 791.6413, Test: 822.4876 [130.65], Avg: 254.4153 (0.501)
+Ep: 229, Reward: 622.1719, Test: 702.5394 [245.39], Avg: 255.2968 (0.500)
+Ep: 230, Reward: 722.3203, Test: 759.6445 [178.05], Avg: 256.7094 (0.498)
+Ep: 231, Reward: 810.4912, Test: 791.8046 [197.75], Avg: 258.1635 (0.495)
+Ep: 232, Reward: 856.4374, Test: 828.4602 [111.40], Avg: 260.1330 (0.494)
+Ep: 233, Reward: 851.4695, Test: 780.2678 [188.85], Avg: 261.5487 (0.492)
+Ep: 234, Reward: 762.2480, Test: 832.7456 [147.04], Avg: 263.3536 (0.491)
+Ep: 235, Reward: 927.6961, Test: 818.1295 [135.76], Avg: 265.1292 (0.489)
+Ep: 236, Reward: 902.3529, Test: 763.5629 [111.10], Avg: 266.7635 (0.488)
+Ep: 237, Reward: 695.0304, Test: 726.3955 [166.96], Avg: 267.9932 (0.486)
+Ep: 238, Reward: 764.8617, Test: 769.9173 [178.08], Avg: 269.3482 (0.485)
+Ep: 239, Reward: 842.2661, Test: 898.6670 [16.51], Avg: 271.9016 (0.483)
+Ep: 240, Reward: 917.0918, Test: 887.2342 [60.42], Avg: 274.2041 (0.482)
+Ep: 241, Reward: 955.0007, Test: 832.3993 [135.53], Avg: 275.9506 (0.480)
+Ep: 242, Reward: 840.4463, Test: 835.9274 [184.77], Avg: 277.4947 (0.479)
+Ep: 243, Reward: 933.5005, Test: 859.8263 [118.90], Avg: 279.3940 (0.478)
+Ep: 244, Reward: 874.3827, Test: 850.7391 [107.35], Avg: 281.2878 (0.476)
+Ep: 245, Reward: 844.6374, Test: 820.6325 [122.48], Avg: 282.9824 (0.475)
+Ep: 246, Reward: 891.7106, Test: 893.8171 [24.63], Avg: 285.3557 (0.473)
+Ep: 247, Reward: 902.5276, Test: 868.3275 [73.53], Avg: 287.4099 (0.472)
+Ep: 248, Reward: 882.2575, Test: 801.2984 [90.72], Avg: 289.1094 (0.470)
+Ep: 249, Reward: 827.0934, Test: 695.7972 [150.53], Avg: 290.1340 (0.469)

@@ -1,0 +1,142 @@
+Model: <class 'models.singleagent.sac.SACAgent'>, Env: Pendulum-v0/pytorch, Date: 21/03/2020 23:48:03
+CPU: 8 Core, 5.0GHz, 62.66 GB, Linux-5.3.0-42-generic-x86_64-with-Ubuntu-18.04-bionic
+GPU 0: GeForce RTX 2070, 7.98 GB (Driver: 440.64.00)
+Git URL: git@github.com:shawnmanuel000/WorldModelsForDeepRL.git
+Hash: 38ab67dc76409712eddc813082a866150ac144b7
+Branch: master
+
+num_envs: 16,
+state_size: (3,),
+action_size: (1,),
+action_space: Box(1,),
+envs: <class 'utils.envs.EnvManager'>,
+statemodel: <utils.wrappers.RawStack object at 0x7f29dd28bc18>,
+
+import gym
+import torch
+import random
+import numpy as np
+from utils.rand import ReplayBuffer
+from utils.network import PTACNetwork, PTACAgent, PTQNetwork, MAX_BUFFER_SIZE, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, Conv, EPS_DECAY, DISCOUNT_RATE
+
+LEARN_RATE = 0.0003
+REPLAY_BATCH_SIZE = 128
+TARGET_UPDATE_RATE = 0.001
+
+class SACActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.action_sig = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		
+	def forward(self, state, action=None, sample=True):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		action_mu = self.action_mu(state)
+		action_sig = self.action_sig(state).clamp(-20,2).exp()
+		# epsilon = torch.randn_like(action_sig)
+		# action = action_mu + action_sig*epsilon if action is None else action
+		# log_prob = torch.distributions.Normal(action_mu, action_sig).log_prob(action)
+		# log_prob -= torch.log(1-action.tanh().pow(2)+1e-6)
+		dist = torch.distributions.Normal(action_mu, action_sig)
+		action = dist.rsample() if sample else action_mu
+		log_prob = dist.log_prob(action) - torch.log(1-action.tanh().pow(2)+1e-6)
+		return action.tanh(), log_prob
+
+class SACCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.net_state = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.net_action = torch.nn.Linear(action_size[-1], INPUT_LAYER)
+		self.net_layer1 = torch.nn.Linear(2*INPUT_LAYER, CRITIC_HIDDEN)
+		self.net_layer2 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.q_value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, action):
+		state = self.net_state(state).relu()
+		net_action = self.net_action(action).relu()
+		net_layer = torch.cat([state, net_action], dim=-1)
+		net_layer = self.net_layer1(net_layer).relu()
+		net_layer = self.net_layer2(net_layer).relu()
+		q_value = self.q_value(net_layer)
+		return q_value
+
+class SACNetwork(PTACNetwork):
+	def __init__(self, state_size, action_size, actor=SACActor, critic=SACCritic, lr=LEARN_RATE, tau=TARGET_UPDATE_RATE, gpu=True, load=None, name="sac"): 
+		super().__init__(state_size, action_size, actor=actor, critic=critic, lr=lr, tau=tau, gpu=gpu, load=load, name=name)
+		self.qnetwork = PTQNetwork(state_size, action_size, critic=critic, lr=lr, tau=tau, gpu=gpu, load=load, name=name)
+		self.log_alpha = torch.nn.Parameter(torch.zeros(1, requires_grad=True).to(self.device))
+		self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
+		self.target_entropy = -np.product(action_size)
+
+	def get_action_probs(self, state, action_in=None, grad=False, numpy=False, sample=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action, log_prob = self.actor_local(state.to(self.device), action_in, sample)
+			return [x.cpu().numpy() if numpy else x for x in [action, log_prob]]
+
+	def get_q_value(self, state, action, use_target=False, use_second=False, grad=False, numpy=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			network = self if not use_second else self.qnetwork
+			critic = network.critic_local if not use_target else network.critic_target
+			return critic(state, action).cpu().numpy() if numpy else critic(state, action)
+	
+	def optimize(self, states, actions, next_states, rewards, dones, importances=torch.tensor(1.0), gamma=DISCOUNT_RATE):
+		alpha = self.log_alpha.clamp(-20, 2).detach().exp()
+		next_actions, next_log_prob = self.actor_local(next_states)
+		# q1_nexts = self.critic_target(next_states, next_actions)
+		q1_nexts = self.get_q_value(next_states, next_actions, use_target=True, use_second=False)
+		q2_nexts = self.get_q_value(next_states, next_actions, use_target=True, use_second=True)
+		q_nexts = torch.min(q1_nexts, q2_nexts) - alpha*next_log_prob
+		# q_nexts = q1_nexts - alpha*next_log_prob
+		q_targets = rewards.unsqueeze(-1) + gamma * (1 - dones.unsqueeze(-1)) * q_nexts
+
+		# q1_values = self.critic_local(states, actions)
+		q1_values = self.get_q_value(next_states, next_actions, use_second=False, grad=True)
+		critic1_loss = (q1_values - q_targets.detach()).pow(2) * importances.to(self.device)
+		self.step(self.critic_optimizer, critic1_loss.mean(), self.critic_local.parameters(), retain=True)
+		self.soft_copy(self.critic_local, self.critic_target)
+
+		q2_values = self.get_q_value(next_states, next_actions, use_second=True, grad=True)
+		critic2_loss = (q2_values - q_targets.detach()).pow(2) * importances.to(self.device)
+		self.step(self.qnetwork.critic_optimizer, critic2_loss.mean(), self.qnetwork.critic_local.parameters())
+		self.soft_copy(self.qnetwork.critic_local, self.qnetwork.critic_target)
+
+		actor_action, log_prob = self.actor_local(states)
+		# q1_values = self.critic_local(states, actor_action)
+		q1_values = self.get_q_value(states, actor_action, use_second=False, grad=True)
+		q2_values = self.get_q_value(states, actor_action, use_second=True, grad=True)
+		actor_loss = alpha*log_prob - torch.min(q1_values, q2_values)
+		# actor_loss = alpha*log_prob - q1_values
+		self.step(self.actor_optimizer, actor_loss.mean(), self.actor_local.parameters(), 5)
+		
+		alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy))
+		self.step(self.alpha_optimizer, alpha_loss.mean())
+
+class SACAgent(PTACAgent):
+	def __init__(self, state_size, action_size, decay=EPS_DECAY, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, SACNetwork, decay=decay, lr=lr, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True, e_greedy=False):
+		action = self.network.get_action_probs(self.to_tensor(state), numpy=True, sample=sample)[0]
+		return action
+		
+	def train(self, state, action, next_state, reward, done):
+		self.replay_buffer.extend(list(zip(state, action, next_state, reward, done)), shuffle=False)	
+		if len(self.replay_buffer) > REPLAY_BATCH_SIZE:
+			states, actions, next_states, rewards, dones = self.replay_buffer.sample(REPLAY_BATCH_SIZE, dtype=self.to_tensor)[0]
+			self.network.optimize(states, actions, next_states, rewards, dones)
+
+
+Step:       0, Reward: -1114.162 [148.247], Avg: -1114.162 (1.0000) <0-00:00:00> 
+Step:    1000, Reward: -1396.076 [283.812], Avg: -1255.119 (1.0000) <0-00:00:23> 
+Step:    2000, Reward: -1219.844 [382.578], Avg: -1243.361 (1.0000) <0-00:00:47> 
+Step:    3000, Reward: -1136.541 [294.112], Avg: -1216.656 (1.0000) <0-00:01:11> 
+Step:    4000, Reward: -1298.95 [341.988], Avg: -1233.115 (1.0000) <0-00:01:35> 
+Step:    5000, Reward: -1191.311 [305.947], Avg: -1226.147 (1.0000) <0-00:01:59> 
+Step:    6000, Reward: -1214.469 [266.013], Avg: -1224.479 (1.0000) <0-00:02:22> 

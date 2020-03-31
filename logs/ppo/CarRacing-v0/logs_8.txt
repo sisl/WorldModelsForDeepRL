@@ -1,0 +1,300 @@
+Model: <class 'models.ppo.PPOAgent'>, Env: CarRacing-v0, Date: 21/03/2020 11:55:55
+CPU: 4 Core, 2.2GHz, 16.0 GB, Darwin-18.7.0-x86_64-i386-64bit
+Git URL: git@github.com:shawnmanuel000/WorldModelsForDeepRL.git
+Hash: 552670128993ed5186bb19c3aba0b251695c6d82
+Branch: master
+
+num_envs: 3,
+state_size: (96, 96, 3),
+action_size: (3,),
+action_space: Box(3,),
+envs: <class 'utils.envs.EnvManager'>,
+
+import gym
+import torch
+import pickle
+import argparse
+import numpy as np
+from models.rand import ReplayBuffer, PrioritizedReplayBuffer
+from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, DISCOUNT_RATE, NUM_STEPS, ADVANTAGE_DECAY
+
+BATCH_SIZE = 32					# Number of samples to train on for each train step
+PPO_EPOCHS = 2					# Number of iterations to sample batches for training
+ENTROPY_WEIGHT = 0.005			# The weight for the entropy term of the Actor loss
+CLIP_PARAM = 0.05				# The limit of the ratio of new action probabilities to old probabilities
+
+class PPOActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, action_size[-1])
+		self.action_sig = torch.nn.Parameter(torch.zeros(action_size[-1]))
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		
+	def forward(self, state, action=None, sample=True):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		action_mu = self.action_mu(state)
+		action_sig = self.action_sig.exp().expand_as(action_mu)
+		dist = torch.distributions.Normal(action_mu, action_sig)
+		action = dist.sample() if action is None else action
+		log_prob = dist.log_prob(action)
+		entropy = dist.entropy()
+		return action, log_prob, entropy
+
+class PPOCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		value = self.value(state)
+		return value
+
+class PPONetwork(PTACNetwork):
+	def __init__(self, state_size, action_size, actor=PPOActor, critic=PPOCritic, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, actor=actor, critic=critic, lr=lr, gpu=gpu, load=load, name="ppo")
+
+	def get_action_probs(self, state, action_in=None, grad=False, numpy=False, sample=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action, log_prob, entropy = self.actor_local(state.to(self.device), action_in, sample)
+			action_or_entropy = action if action_in is None else entropy.mean()
+			return (x.cpu().numpy() if numpy else x for x in [action_or_entropy, log_prob])
+
+	def get_value(self, state, grad=False, numpy=False):
+		with torch.enable_grad() if grad else torch.no_grad():
+			return self.critic_local(state.to(self.device)).cpu().numpy() if numpy else self.critic_local(state.to(self.device))
+
+	def optimize(self, states, actions, old_log_probs, targets, advantages, importances=torch.tensor(1.0), clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT, scale=1):
+		values = self.get_value(states, grad=True)
+		critic_error = values - targets
+		critic_loss = importances.to(self.device) * critic_error.pow(2) * scale
+		self.step(self.critic_optimizer, critic_loss.mean())
+
+		entropy, new_log_probs = self.get_action_probs(states, actions, grad=True)
+		ratio = (new_log_probs - old_log_probs).exp()
+		ratio_clipped = torch.clamp(ratio, 1.0-clip_param, 1.0+clip_param)
+		actor_loss = -(torch.min(ratio*advantages, ratio_clipped*advantages) + e_weight*entropy) * scale
+		self.step(self.actor_optimizer, actor_loss.mean())
+		return critic_error.cpu().detach().numpy().squeeze(-1)
+
+class PPOAgent(PTACAgent):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, update_freq=NUM_STEPS, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPONetwork, lr=lr, update_freq=update_freq, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True):
+		state = self.to_tensor(state)
+		self.action, self.log_prob = self.network.get_action_probs(state, numpy=True, sample=sample)
+		return np.tanh(self.action)
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, self.action, self.log_prob, reward, done))
+		if np.any(done[0]) or len(self.buffer) >= self.update_freq:
+			states, actions, log_probs, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+			self.buffer.clear()
+			states = torch.cat([states, self.to_tensor(next_state).unsqueeze(0)], dim=0)
+			values = self.network.get_value(states)
+			targets, advantages = self.compute_gae(values[-1], rewards.unsqueeze(-1), dones.unsqueeze(-1), values[:-1])
+			states, actions, log_probs, targets, advantages = [x.view(x.size(0)*x.size(1), *x.size()[2:]) for x in (states[:-1], actions, log_probs, targets, advantages)]
+			self.replay_buffer.clear().extend(list(zip(states, actions, log_probs, targets, advantages)), shuffle=True)
+			for _ in range((len(self.replay_buffer)*PPO_EPOCHS)//BATCH_SIZE):
+				state, action, log_prob, target, advantage = self.replay_buffer.next_batch(BATCH_SIZE, torch.stack)
+				self.network.optimize(state, action, log_prob, target, advantage, scale=16*dones.size(0)/len(self.replay_buffer))
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500					# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+SAVE_DIR = "./saved_models"
+
+import os
+import gym
+import torch
+import argparse
+import numpy as np
+import vizdoom as vzd
+from collections import deque
+from models.ppo import PPOAgent
+from models.rand import RandomAgent
+from models.ddpg import DDPGAgent, EPS_MIN
+from utils.wrappers import WorldACAgent
+from utils.multiprocess import set_rank_size
+# from utils.wrappers import RawStack, ImgStack, WorldModel
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, GymEnv
+from utils.misc import Logger, rollout
+from dependencies import VizDoomEnv
+
+TRIAL_AT = 1000
+SAVE_AT = 1
+
+# env_name = "basic"
+# env_name = "my_way_home"
+# env_name = "health_gathering"
+# env_name = "predict_position"
+# env_name = "defend_the_center"
+# env_name = "defend_the_line"
+# env_name = "take_cover"
+env_names = ["defend_the_line", "take_cover", "CarRacing-v0"]
+env_name = env_names[-1]
+models = {"ppo":PPOAgent, "ddpg":DDPGAgent}
+
+def make_env():
+	if "-v" in env_name:
+		env = gym.make(env_name)
+		env.env.verbose = 0
+	else:
+		env = VizDoomEnv(env_name)
+	return GymEnv(env)
+
+# class WorldACAgent(RandomAgent):
+# 	def __init__(self, state_size, action_size, acagent, num_envs, load="", gpu=True, train=True, worldmodel=True):
+# 		super().__init__(action_size)
+# 		statemodel = WorldModel if worldmodel else ImgStack if len(state_size)==3 else RawStack
+# 		self.state_model = statemodel(action_size, num_envs, load=load, gpu=gpu)
+# 		self.acagent = acagent(self.state_model.state_size, action_size, load="" if train else load, gpu=gpu)
+
+# 	def get_env_action(self, env, state, eps=None, sample=True):
+# 		state, latent = self.state_model.get_state(state)
+# 		env_action, action = self.acagent.get_env_action(env, state, eps, sample)
+# 		self.state_model.step(latent, env_action)
+# 		return env_action, action, state
+
+# 	def train(self, state, action, next_state, reward, done):
+# 		next_state = self.state_model.get_state(next_state)[0]
+# 		self.acagent.train(state, action, next_state, reward, done)
+
+# 	def reset(self, num_envs=None):
+# 		num_envs = self.state_model.num_envs if num_envs is None else num_envs
+# 		self.state_model.reset(num_envs, restore=False)
+# 		return self
+
+# 	def save_model(self, dirname="pytorch", name="best"):
+# 		self.acagent.network.save_model(dirname, name)
+
+# 	def load(self, dirname="pytorch", name="best"):
+# 		self.state_model.load_model(dirname, name)
+# 		self.acagent.network.load_model(dirname, name)
+# 		return self
+
+def run(model, statemodel, runs=1, load_dir="", ports=16, render=False):
+	num_envs = len(ports) if type(ports) == list else min(ports, 16)
+	logger = Logger(model, load_dir, statemodel=statemodel, num_envs=num_envs)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
+	agent = WorldACAgent(envs.action_size, num_envs, model, statemodel, load=load_dir)
+	total_rewards = []
+	for ep in range(runs):
+		states = envs.reset()
+		agent.reset(num_envs)
+		total_reward = 0
+		for _ in range(1000):
+			env_actions, actions, states = agent.get_env_action(envs.env, states)
+			next_states, rewards, dones, _ = envs.step(env_actions, render=(ep%runs==0))
+			agent.train(states, actions, next_states, rewards, dones)
+			total_reward += np.mean(rewards)
+			states = next_states
+		rollouts = rollout(envs, agent, render=render)
+		test_reward = np.mean(rollouts)
+		total_rewards.append(test_reward)
+		agent.save_model(load_dir, "checkpoint")
+		if total_rewards[-1] >= max(total_rewards): agent.save_model(load_dir)
+		logger.log(f"Ep: {ep:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.acagent.eps:.4f})")
+	envs.close()
+
+def train(make_env, model, ports, steps, checkpoint=None, save_best=False, log=True, render=False):
+	envs = (EnvManager if len(ports)>0 else EnsembleEnv)(make_env, ports)
+	agent = WorldACAgent(envs.state_size, envs.action_size, model, envs.num_envs, load="", gpu=True, worldmodel=True) 
+	logger = Logger(model, env_name, num_envs=envs.num_envs, state_size=agent.state_size, action_size=envs.action_size, action_space=envs.env.action_space, envs=type(envs))
+	states = envs.reset(train=True)
+	total_rewards = []
+	for s in range(steps+1):
+		env_actions, actions, states = agent.get_env_action(envs.env, states)
+		next_states, rewards, dones, _ = envs.step(env_actions, train=True)
+		agent.train(states, actions, next_states, rewards, dones)
+		states = next_states
+		if s%TRIAL_AT==0:
+			rollouts = rollout(envs, agent, render=render)
+			total_rewards.append(np.round(np.mean(rollouts, axis=-1), 3))
+			if checkpoint and len(total_rewards) % SAVE_AT==0: agent.save_model(checkpoint)
+			if save_best and np.all(total_rewards[-1] >= np.max(total_rewards, axis=-1)): agent.save_model(env_name, "best")
+			if log: logger.log(f"Step: {s:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.eps:.4f})")
+	envs.close()
+
+def trial(make_env, model, steps=40000, ports=4):
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
+	agent = model(envs.state_size, envs.action_size, decay=0.99)
+	env = make_env()
+	state = envs.reset()
+	test_rewards = []
+	for s in range(steps):
+		env_action, action = agent.get_env_action(env, state)
+		next_state, reward, done, _ = envs.step(env_action)
+		agent.train(state, action, next_state, reward, done)
+		state = next_state
+		if np.any(done[0]):
+			test_reward = np.mean([rollout(env, agent) for _ in range(10)])
+			test_rewards.append(test_reward)
+			print(f"Ep: {s//env.spec.max_episode_steps}, Rewards: {test_reward}, Avg: {np.mean(test_rewards)}")
+			if test_reward > -200: break
+	env.close()
+	envs.close()
+
+def parse_args(envs, models):
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--model", type=str, default="ppo", choices=models, help="Which RL algorithm to use. Allowed values are:\n"+', '.join(models), metavar="model")
+	parser.add_argument("--env_name", type=str, default=env_name, choices=envs, help="Name of the environment to use. Allowed values are:\n"+', '.join(envs), metavar="env_name")
+	parser.add_argument("--tcp_ports", type=int, default=[], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--tcp_rank", type=int, default=0, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--render", action="store_true", help="Whether to render an environment rollout")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run training on the Pendulum-v0 environment")
+	parser.add_argument("--steps", type=int, default=100000, help="Number of steps to train the agent")
+	parser.add_argument("--iternum", type=int, default=-1, choices=[-1,0,1], help="Whether to train using World Model to load (0 or 1) or raw images (-1)")
+
+	parser.add_argument("--workerports", type=int, default=[2], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	# parser.add_argument("--model", type=str, default="ppo", choices=["ddpg", "ppo"], help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--runs", type=int, default=1, help="Number of episodes to train the agent")
+	args = parser.parse_args()
+	return args
+
+if __name__ == "__main__":
+	args = parse_args(env_names, models.keys())
+	model = models[args.model]
+	checkpoint = f"{env_name}/pytorch" if args.iternum < 0 else f"{env_name}/iter{args.iternum}/"
+	rank, size = set_rank_size(args.tcp_rank, args.tcp_ports)
+	if rank>0:
+		EnvWorker(make_env=make_env).start()
+	# elif args.selfport is not None:
+		# EnvWorker(args.selfport, make_env).start()
+	if args.trial:
+		trial(make_env=make_env, model=model)
+	else:
+		# if len(args.workerports) == 1: args.workerports = args.workerports[0]
+		# run(model, state, args.runs, checkpoint, args.workerports)
+		train(make_env=make_env, model=model, ports=list(range(1,size)), steps=args.steps, checkpoint=checkpoint, render=args.render)
+
+Step:       0, Reward: -44.404 [7.091], Avg: -44.404 (1.0000) <0-00:00:00> 
+Step:    1000, Reward: -46.848 [2.656], Avg: -45.626000000000005 (1.0000) <0-00:01:03> 
+Step:    2000, Reward: -40.933 [3.971], Avg: -44.06166666666667 (1.0000) <0-00:02:03> 
+Step:    3000, Reward: -37.805 [3.705], Avg: -42.4975 (1.0000) <0-00:03:07> 
+Step:    4000, Reward: -42.221 [6.771], Avg: -42.4422 (1.0000) <0-00:04:08> 
+Step:    5000, Reward: -39.016 [2.763], Avg: -41.87116666666667 (1.0000) <0-00:05:04> 
+Step:    6000, Reward: -43.701 [2.433], Avg: -42.13257142857143 (1.0000) <0-00:06:01> 
+Step:    7000, Reward: -40.358 [1.911], Avg: -41.91075 (1.0000) <0-00:07:02> 

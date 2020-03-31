@@ -1,0 +1,758 @@
+Model: <class 'models.ppo.PPOAgent'>, Env: CarRacing-v0/pytorch, Date: 21/03/2020 10:17:21
+CPU: 8 Core, 5.0GHz, 62.66 GB, Linux-5.3.0-42-generic-x86_64-with-Ubuntu-18.04-bionic
+GPU 0: GeForce RTX 2070, 7.98 GB (Driver: 440.64.00)
+Git URL: git@github.com:shawnmanuel000/WorldModelsForDeepRL.git
+Hash: 552670128993ed5186bb19c3aba0b251695c6d82
+Branch: master
+
+statemodel: <class 'utils.envs.ImgStack'>,
+num_envs: 16,
+
+import gym
+import torch
+import pickle
+import argparse
+import numpy as np
+from models.rand import ReplayBuffer, PrioritizedReplayBuffer
+from utils.network import PTACNetwork, PTACAgent, Conv, INPUT_LAYER, ACTOR_HIDDEN, CRITIC_HIDDEN, LEARN_RATE, DISCOUNT_RATE, NUM_STEPS, ADVANTAGE_DECAY
+
+BATCH_SIZE = 32					# Number of samples to train on for each train step
+PPO_EPOCHS = 2					# Number of iterations to sample batches for training
+ENTROPY_WEIGHT = 0.005			# The weight for the entropy term of the Actor loss
+CLIP_PARAM = 0.05				# The limit of the ratio of new action probabilities to old probabilities
+
+class PPOActor(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, ACTOR_HIDDEN)
+		self.layer3 = torch.nn.Linear(ACTOR_HIDDEN, ACTOR_HIDDEN)
+		self.action_mu = torch.nn.Linear(ACTOR_HIDDEN, *action_size)
+		self.action_sig = torch.nn.Parameter(torch.zeros(*action_size))
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+		
+	def forward(self, state, action=None, sample=True):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		action_mu = self.action_mu(state)
+		action_sig = self.action_sig.exp().expand_as(action_mu)
+		dist = torch.distributions.Normal(action_mu, action_sig)
+		action = dist.sample() if action is None else action
+		log_prob = dist.log_prob(action)
+		entropy = dist.entropy()
+		return action, log_prob, entropy
+
+class PPOCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size):
+		super().__init__()
+		self.layer1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)==1 else Conv(state_size, INPUT_LAYER)
+		self.layer2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.layer3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.value = torch.nn.Linear(CRITIC_HIDDEN, 1)
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state):
+		state = self.layer1(state).relu()
+		state = self.layer2(state).relu()
+		state = self.layer3(state).relu()
+		value = self.value(state)
+		return value
+
+class PPONetwork(PTACNetwork):
+	def __init__(self, state_size, action_size, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPOActor, PPOCritic, lr=lr, gpu=gpu, load=load)
+
+	def get_action_probs(self, state, action_in=None, sample=True, grad=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			action, log_prob, entropy = self.actor_local(state.to(self.device), action_in, sample)
+			return action if action_in is None else entropy.mean(), log_prob
+
+	def get_value(self, state, grad=True):
+		with torch.enable_grad() if grad else torch.no_grad():
+			return self.critic_local(state.to(self.device))
+
+	def optimize(self, states, actions, old_log_probs, targets, advantages, importances=torch.scalar_tensor(1), clip_param=CLIP_PARAM, e_weight=ENTROPY_WEIGHT, scale=1):
+		values = self.get_value(states)
+		critic_error = values - targets
+		critic_loss = importances.to(self.device) * critic_error.pow(2) * scale
+		self.step(self.critic_optimizer, critic_loss.mean())
+
+		entropy, new_log_probs = self.get_action_probs(states, actions)
+		ratio = (new_log_probs - old_log_probs).exp()
+		ratio_clipped = torch.clamp(ratio, 1.0-clip_param, 1.0+clip_param)
+		actor_loss = -(torch.min(ratio*advantages, ratio_clipped*advantages) + e_weight*entropy) * scale
+		self.step(self.actor_optimizer, actor_loss.mean())
+		return critic_error.cpu().detach().numpy().squeeze(-1)
+
+	def save_model(self, dirname="pytorch", name="best"):
+		super().save_model("ppo", dirname, name)
+		
+	def load_model(self, dirname="pytorch", name="best"):
+		super().load_model("ppo", dirname, name)
+
+class PPOAgent(PTACAgent):
+	def __init__(self, state_size, action_size, update_freq=NUM_STEPS, lr=LEARN_RATE, gpu=True, load=None):
+		super().__init__(state_size, action_size, PPONetwork, lr=lr, update_freq=update_freq, gpu=gpu, load=load)
+
+	def get_action(self, state, eps=None, sample=True):
+		state = self.to_tensor(state)
+		self.action, self.log_prob = [x.cpu().numpy() for x in self.network.get_action_probs(state, sample=sample, grad=False)]
+		return np.tanh(self.action)
+
+	def train(self, state, action, next_state, reward, done):
+		self.buffer.append((state, self.action, self.log_prob, reward, done))
+		if done[0] or len(self.buffer) >= self.update_freq:
+			states, actions, log_probs, rewards, dones = map(self.to_tensor, zip(*self.buffer))
+			self.buffer.clear()
+			next_state = self.to_tensor(next_state)
+			values = self.network.get_value(states, grad=False)
+			next_value = self.network.get_value(next_state, grad=False)
+			targets, advantages = self.compute_gae(next_value, rewards.unsqueeze(-1), dones.unsqueeze(-1), values, gamma=DISCOUNT_RATE, lamda=ADVANTAGE_DECAY)
+			states, actions, log_probs, targets, advantages = [x.view(x.size(0)*x.size(1), *x.size()[2:]) for x in (states, actions, log_probs, targets, advantages)]
+			self.replay_buffer.clear().extend(list(zip(states, actions, log_probs, targets, advantages)), shuffle=True)
+			for _ in range((len(self.replay_buffer)*PPO_EPOCHS)//BATCH_SIZE):
+				state, action, log_prob, target, advantage = self.replay_buffer.next_batch(BATCH_SIZE, torch.stack)
+				self.network.optimize(state, action, log_prob, target, advantage, scale=16*dones.size(0)/len(self.replay_buffer))
+REG_LAMBDA = 1e-6             	# Penalty multiplier to apply for the size of the network weights
+LEARN_RATE = 0.0001           	# Sets how much we want to update the network weights at each training step
+TARGET_UPDATE_RATE = 0.0004   	# How frequently we want to copy the local network to the target network (for double DQNs)
+INPUT_LAYER = 512				# The number of output nodes from the first layer to Actor and Critic networks
+ACTOR_HIDDEN = 256				# The number of nodes in the hidden layers of the Actor network
+CRITIC_HIDDEN = 1024			# The number of nodes in the hidden layers of the Critic networks
+DISCOUNT_RATE = 0.99			# The discount rate to use in the Bellman Equation
+NUM_STEPS = 500				# The number of steps to collect experience in sequence for each GAE calculation
+EPS_MAX = 1.0                 	# The starting proportion of random to greedy actions to take
+EPS_MIN = 0.020               	# The lower limit proportion of random to greedy actions to take
+EPS_DECAY = 0.980             	# The rate at which eps decays from EPS_MAX to EPS_MIN
+ADVANTAGE_DECAY = 0.95			# The discount factor for the cumulative GAE calculation
+MAX_BUFFER_SIZE = 100000      	# Sets the maximum length of the replay buffer
+
+import os
+import gym
+import torch
+import argparse
+import numpy as np
+import vizdoom as vzd
+from collections import deque
+from models.ppo import PPOAgent
+from models.rand import RandomAgent
+from models.ddpg import DDPGAgent, EPS_MIN
+from utils.envs import EnsembleEnv, EnvManager, EnvWorker, WorldModel, ImgStack
+from utils.misc import Logger, rollout
+from dependencies import VizDoomEnv
+
+# env_name = "basic"
+# env_name = "my_way_home"
+# env_name = "health_gathering"
+# env_name = "predict_position"
+# env_name = "defend_the_center"
+# env_name = "defend_the_line"
+# env_name = "take_cover"
+env_name = "CarRacing-v0"
+
+def make_env():
+	if "-v" in env_name:
+		env = gym.make(env_name)
+		env.env.verbose = 0
+	else:
+		env = VizDoomEnv(env_name)
+	return env
+
+class WorldACAgent(RandomAgent):
+	def __init__(self, action_size, num_envs, acagent, statemodel=WorldModel, load="", gpu=True, train=True):
+		super().__init__(action_size)
+		self.world_model = statemodel(action_size, num_envs, load=load, gpu=gpu)
+		self.acagent = acagent(self.world_model.state_size, action_size, load="" if train else load, gpu=gpu)
+
+	def get_env_action(self, env, state, eps=None, sample=True):
+		state, latent = self.world_model.get_state(state)
+		env_action, action = self.acagent.get_env_action(env, state, eps, sample)
+		self.world_model.step(latent, env_action)
+		return env_action, action, state
+
+	def train(self, state, action, next_state, reward, done):
+		next_state = self.world_model.get_state(next_state)[0]
+		self.acagent.train(state, action, next_state, reward, done)
+
+	def reset(self, num_envs=None):
+		num_envs = self.world_model.num_envs if num_envs is None else num_envs
+		self.world_model.reset(num_envs, restore=False)
+		return self
+
+	def save_model(self, dirname="pytorch", name="best"):
+		self.acagent.network.save_model(dirname, name)
+
+	def load(self, dirname="pytorch", name="best"):
+		self.world_model.load_model(dirname, name)
+		self.acagent.network.load_model(dirname, name)
+		return self
+
+def run(model, statemodel, runs=1, load_dir="", ports=16, render=False):
+	num_envs = len(ports) if type(ports) == list else min(ports, 16)
+	logger = Logger(model, load_dir, statemodel=statemodel, num_envs=num_envs)
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
+	agent = WorldACAgent(envs.action_size, num_envs, model, statemodel, load=load_dir)
+	total_rewards = []
+	for ep in range(runs):
+		states = envs.reset()
+		agent.reset(num_envs)
+		total_reward = 0
+		for _ in range(1000):
+			env_actions, actions, states = agent.get_env_action(envs.env, states)
+			next_states, rewards, dones, _ = envs.step(env_actions, render=(ep%runs==0))
+			agent.train(states, actions, next_states, rewards, dones)
+			total_reward += np.mean(rewards)
+			states = next_states
+		rollouts = rollout(envs, agent, render=render)
+		test_reward = np.mean(rollouts)
+		total_rewards.append(test_reward)
+		agent.save_model(load_dir, "checkpoint")
+		if total_rewards[-1] >= max(total_rewards): agent.save_model(load_dir)
+		logger.log(f"Ep: {ep:7d}, Reward: {total_rewards[-1]} [{np.std(rollouts):4.3f}], Avg: {np.mean(total_rewards, axis=0)} ({agent.acagent.eps:.4f})")
+	envs.close()
+
+def trial(model, steps=40000, ports=16):
+	# env_name = "Pendulum-v0"
+	envs = EnvManager(make_env, ports) if type(ports) == list else EnsembleEnv(make_env, ports)
+	agent = model(envs.state_size, envs.action_size, decay=0.99)
+	env = make_env()
+	state = envs.reset()
+	test_rewards = []
+	for s in range(steps):
+		env_action, action = agent.get_env_action(env, state)
+		next_state, reward, done, _ = envs.step(env_action)
+		agent.train(state, action, next_state, reward, done)
+		state = next_state
+		if np.any(done[0]):
+			test_reward = np.mean([rollout(env, agent) for _ in range(10)])
+			test_rewards.append(test_reward)
+			print(f"Ep: {s//env.spec.max_episode_steps}, Rewards: {test_reward}, Avg: {np.mean(test_rewards)}")
+			if test_reward > -200: break
+	env.close()
+	envs.close()
+
+def parse_args():
+	parser = argparse.ArgumentParser(description="A3C Trainer")
+	parser.add_argument("--workerports", type=int, default=[2], nargs="+", help="The list of worker ports to connect to")
+	parser.add_argument("--selfport", type=int, default=None, help="Which port to listen on (as a worker server)")
+	parser.add_argument("--iternum", type=int, default=-1, choices=[-1,0,1], help="Whether to train using World Model to load (0 or 1) or raw images (-1)")
+	parser.add_argument("--model", type=str, default="ppo", choices=["ddpg", "ppo"], help="Which reinforcement learning algorithm to use")
+	parser.add_argument("--runs", type=int, default=1, help="Number of episodes to train the agent")
+	parser.add_argument("--trial", action="store_true", help="Whether to show a trial run training on the Pendulum-v0 environment")
+	args = parser.parse_args()
+	return args
+
+if __name__ == "__main__":
+	args = parse_args()
+	dirname = f"{env_name}/pytorch" if args.iternum < 0 else f"{env_name}/iter{args.iternum}/"
+	state = ImgStack if args.iternum < 0 else WorldModel
+	model = PPOAgent if args.model == "ppo" else DDPGAgent
+	if args.trial:
+		trial(model, ports=args.workerports[0])
+	elif args.selfport is not None:
+		EnvWorker(args.selfport, make_env).start()
+	else:
+		if len(args.workerports) == 1: args.workerports = args.workerports[0]
+		run(model, state, args.runs, dirname, args.workerports)
+
+Ep:       0, Reward: -32.64981764021748 [5.744], Avg: -32.64981764021748 (1.0000) <0-00:00:00> 
+Ep:       1, Reward: -32.14619233091159 [6.410], Avg: -32.39800498556453 (1.0000) <0-00:00:46> 
+Ep:       2, Reward: -30.55352868929051 [7.346], Avg: -31.78317955347319 (1.0000) <0-00:01:31> 
+Ep:       3, Reward: -29.297908656962093 [7.165], Avg: -31.161861829345415 (1.0000) <0-00:02:17> 
+Ep:       4, Reward: -27.25272305192852 [5.366], Avg: -30.38003407386204 (1.0000) <0-00:03:03> 
+Ep:       5, Reward: -22.004384818555355 [7.379], Avg: -28.984092531310925 (1.0000) <0-00:03:49> 
+Ep:       6, Reward: -22.27747070269644 [7.331], Avg: -28.026003698651714 (1.0000) <0-00:04:36> 
+Ep:       7, Reward: -22.606587795970253 [8.733], Avg: -27.34857671081653 (1.0000) <0-00:05:22> 
+Ep:       8, Reward: -24.361999470839653 [6.772], Avg: -27.016734795263545 (1.0000) <0-00:06:12> 
+Ep:       9, Reward: -22.92778507698952 [9.529], Avg: -26.607839823436144 (1.0000) <0-00:07:00> 
+Ep:      10, Reward: -17.1905256061173 [12.517], Avg: -25.75172034913443 (1.0000) <0-00:07:48> 
+Ep:      11, Reward: -21.747426435513795 [12.451], Avg: -25.418029189666044 (1.0000) <0-00:08:35> 
+Ep:      12, Reward: -18.48361316681533 [16.016], Avg: -24.88461257252368 (1.0000) <0-00:09:21> 
+Ep:      13, Reward: -21.19225303469051 [11.445], Avg: -24.620872605535595 (1.0000) <0-00:10:08> 
+Ep:      14, Reward: -21.741319153792013 [11.733], Avg: -24.428902375419355 (1.0000) <0-00:11:00> 
+Ep:      15, Reward: -26.08012640386693 [17.366], Avg: -24.53210387719733 (1.0000) <0-00:11:47> 
+Ep:      16, Reward: -27.473029934034106 [8.434], Avg: -24.705099527599494 (1.0000) <0-00:12:37> 
+Ep:      17, Reward: -19.651478188830872 [12.416], Avg: -24.424342786556792 (1.0000) <0-00:13:26> 
+Ep:      18, Reward: -20.608775936803468 [12.857], Avg: -24.223523478675038 (1.0000) <0-00:14:15> 
+Ep:      19, Reward: -22.17614247755422 [14.701], Avg: -24.121154428618997 (1.0000) <0-00:15:04> 
+Ep:      20, Reward: -26.090546689036998 [11.917], Avg: -24.214935012448425 (1.0000) <0-00:15:53> 
+Ep:      21, Reward: -22.45173173273137 [12.687], Avg: -24.134789408824926 (1.0000) <0-00:16:42> 
+Ep:      22, Reward: -28.042804694183072 [22.137], Avg: -24.30470311688397 (1.0000) <0-00:17:31> 
+Ep:      23, Reward: -27.764268298151805 [9.665], Avg: -24.448851666103465 (1.0000) <0-00:18:20> 
+Ep:      24, Reward: -16.77071833663683 [13.722], Avg: -24.1417263329248 (1.0000) <0-00:19:10> 
+Ep:      25, Reward: -20.71339813029556 [22.011], Avg: -24.0098675559006 (1.0000) <0-00:19:59> 
+Ep:      26, Reward: -21.371441878944232 [9.787], Avg: -23.912148086383695 (1.0000) <0-00:20:46> 
+Ep:      27, Reward: -13.101126711237058 [23.103], Avg: -23.526040180128458 (1.0000) <0-00:21:34> 
+Ep:      28, Reward: -6.0416624792990286 [31.169], Avg: -22.923130604237787 (1.0000) <0-00:22:23> 
+Ep:      29, Reward: -20.64973404392765 [17.843], Avg: -22.847350718894116 (1.0000) <0-00:23:10> 
+Ep:      30, Reward: -22.43546185075909 [12.865], Avg: -22.834063981212342 (1.0000) <0-00:23:57> 
+Ep:      31, Reward: -10.638401948028987 [29.112], Avg: -22.452949542675363 (1.0000) <0-00:24:44> 
+Ep:      32, Reward: -11.604444064544854 [20.360], Avg: -22.124206952428985 (1.0000) <0-00:25:33> 
+Ep:      33, Reward: -18.25228438242936 [13.466], Avg: -22.01032687684076 (1.0000) <0-00:26:20> 
+Ep:      34, Reward: -12.68120849286598 [24.698], Avg: -21.743780637298624 (1.0000) <0-00:27:09> 
+Ep:      35, Reward: -14.67208424381779 [19.153], Avg: -21.5473446263686 (1.0000) <0-00:27:56> 
+Ep:      36, Reward: -2.274221466913996 [30.729], Avg: -21.0264494058428 (1.0000) <0-00:28:44> 
+Ep:      37, Reward: -21.641601546947328 [21.719], Avg: -21.04263762008239 (1.0000) <0-00:29:31> 
+Ep:      38, Reward: -0.7062093262994695 [40.544], Avg: -20.521190740754626 (1.0000) <0-00:30:17> 
+Ep:      39, Reward: 10.896246915028769 [41.761], Avg: -19.73575479936004 (1.0000) <0-00:31:04> 
+Ep:      40, Reward: -24.458679230509674 [9.423], Avg: -19.850948078168567 (1.0000) <0-00:31:50> 
+Ep:      41, Reward: -11.856951869781595 [24.273], Avg: -19.660614835111737 (1.0000) <0-00:32:36> 
+Ep:      42, Reward: 1.155655818535493 [35.885], Avg: -19.176515517585056 (1.0000) <0-00:33:22> 
+Ep:      43, Reward: -0.41099667697635134 [43.566], Avg: -18.750026453025768 (1.0000) <0-00:34:09> 
+Ep:      44, Reward: -6.340957128553207 [35.620], Avg: -18.474269356926378 (1.0000) <0-00:34:55> 
+Ep:      45, Reward: -6.712834893481598 [40.631], Avg: -18.218585999025404 (1.0000) <0-00:35:41> 
+Ep:      46, Reward: -8.140967874947425 [28.720], Avg: -18.004168592130128 (1.0000) <0-00:36:27> 
+Ep:      47, Reward: -1.2508391573306845 [38.527], Avg: -17.655140895571808 (1.0000) <0-00:37:15> 
+Ep:      48, Reward: 1.6433252112202532 [37.476], Avg: -17.261294648494417 (1.0000) <0-00:38:04> 
+Ep:      49, Reward: -13.62402195634298 [26.916], Avg: -17.18854919465139 (1.0000) <0-00:38:54> 
+Ep:      50, Reward: 13.919872140238905 [55.117], Avg: -16.578580148869225 (1.0000) <0-00:39:41> 
+Ep:      51, Reward: 21.61862380697291 [65.613], Avg: -15.8440185343338 (1.0000) <0-00:40:30> 
+Ep:      52, Reward: 21.154607594258767 [64.216], Avg: -15.145931248888658 (1.0000) <0-00:41:19> 
+Ep:      53, Reward: 44.79884254384061 [78.522], Avg: -14.035842845319598 (1.0000) <0-00:42:09> 
+Ep:      54, Reward: -10.501071651940189 [20.607], Avg: -13.971574278167244 (1.0000) <0-00:42:56> 
+Ep:      55, Reward: 14.712003307174403 [58.338], Avg: -13.459367535571857 (1.0000) <0-00:43:44> 
+Ep:      56, Reward: 36.17540545452394 [71.085], Avg: -12.588582044517546 (1.0000) <0-00:44:32> 
+Ep:      57, Reward: 27.85580638132855 [71.397], Avg: -11.891265002692613 (1.0000) <0-00:45:19> 
+Ep:      58, Reward: 71.7484192260489 [94.438], Avg: -10.473643236103774 (1.0000) <0-00:46:07> 
+Ep:      59, Reward: 57.52758774197933 [88.394], Avg: -9.340289386469056 (1.0000) <0-00:46:57> 
+Ep:      60, Reward: 93.15750857739705 [157.535], Avg: -7.659997616569611 (1.0000) <0-00:47:44> 
+Ep:      61, Reward: 33.74264157350016 [67.272], Avg: -6.992213113503969 (1.0000) <0-00:48:31> 
+Ep:      62, Reward: 35.09444306071283 [72.836], Avg: -6.324170952008465 (1.0000) <0-00:49:18> 
+Ep:      63, Reward: 90.43388204470662 [88.157], Avg: -4.812326373934791 (1.0000) <0-00:50:06> 
+Ep:      64, Reward: 179.90108278899666 [132.490], Avg: -1.9705816175819997 (1.0000) <0-00:50:55> 
+Ep:      65, Reward: 109.17813392584988 [92.175], Avg: -0.28651016995424394 (1.0000) <0-00:51:43> 
+Ep:      66, Reward: 187.14080395586146 [141.482], Avg: 2.5109124289385276 (1.0000) <0-00:52:32> 
+Ep:      67, Reward: 197.46216208357237 [148.800], Avg: 5.377842570918437 (1.0000) <0-00:53:19> 
+Ep:      68, Reward: 241.4256674618077 [171.050], Avg: 8.798825540351615 (1.0000) <0-00:54:08> 
+Ep:      69, Reward: 247.40555012304142 [187.328], Avg: 12.20749303439004 (1.0000) <0-00:54:57> 
+Ep:      70, Reward: 293.79515328984974 [136.008], Avg: 16.173516418269756 (1.0000) <0-00:55:46> 
+Ep:      71, Reward: 334.96564920019364 [153.176], Avg: 20.60118492912981 (1.0000) <0-00:56:35> 
+Ep:      72, Reward: 418.4463782789222 [233.874], Avg: 26.051119084606416 (1.0000) <0-00:57:23> 
+Ep:      73, Reward: 346.82036554692206 [244.180], Avg: 30.385838631394464 (1.0000) <0-00:58:11> 
+Ep:      74, Reward: 383.28213912527576 [197.272], Avg: 35.091122637979545 (1.0000) <0-00:58:58> 
+Ep:      75, Reward: 493.8355860942894 [255.030], Avg: 41.127233999246776 (1.0000) <0-00:59:48> 
+Ep:      76, Reward: 476.7609613289342 [230.855], Avg: 46.784814873658306 (1.0000) <0-01:00:37> 
+Ep:      77, Reward: 445.9917564235769 [236.943], Avg: 51.90285258583675 (1.0000) <0-01:01:27> 
+Ep:      78, Reward: 558.1386679593052 [190.650], Avg: 58.31090088170343 (1.0000) <0-01:02:14> 
+Ep:      79, Reward: 534.0672414486522 [214.797], Avg: 64.25785513879029 (1.0000) <0-01:03:03> 
+Ep:      80, Reward: 484.2337812501079 [222.834], Avg: 69.44274311547323 (1.0000) <0-01:03:51> 
+Ep:      81, Reward: 623.8858509498629 [212.438], Avg: 76.20424443052677 (1.0000) <0-01:04:39> 
+Ep:      82, Reward: 564.8301546897194 [214.724], Avg: 82.09130359027607 (1.0000) <0-01:05:27> 
+Ep:      83, Reward: 556.8861382850397 [245.203], Avg: 87.74362305092802 (1.0000) <0-01:06:16> 
+Ep:      84, Reward: 587.6166460894224 [284.364], Avg: 93.62448214549856 (1.0000) <0-01:07:04> 
+Ep:      85, Reward: 539.35902376902 [233.884], Avg: 98.80744193181857 (1.0000) <0-01:07:51> 
+Ep:      86, Reward: 644.5815420322431 [273.329], Avg: 105.08070745021426 (1.0000) <0-01:08:39> 
+Ep:      87, Reward: 521.5865452994576 [227.086], Avg: 109.81372833486475 (1.0000) <0-01:09:27> 
+Ep:      88, Reward: 538.8355900687624 [262.375], Avg: 114.6341986914254 (1.0000) <0-01:10:16> 
+Ep:      89, Reward: 426.9770172411692 [249.818], Avg: 118.10467445308922 (1.0000) <0-01:11:04> 
+Ep:      90, Reward: 382.0920273915793 [280.979], Avg: 121.00563437549022 (1.0000) <0-01:11:54> 
+Ep:      91, Reward: 629.9453142778486 [254.499], Avg: 126.53758741790716 (1.0000) <0-01:12:40> 
+Ep:      92, Reward: 710.2447330606589 [233.856], Avg: 132.81400833879698 (1.0000) <0-01:13:27> 
+Ep:      93, Reward: 494.2911938520453 [255.656], Avg: 136.65951031234215 (1.0000) <0-01:14:14> 
+Ep:      94, Reward: 491.10028533469756 [243.107], Avg: 140.39046583889328 (1.0000) <0-01:15:01> 
+Ep:      95, Reward: 447.3450115175547 [233.290], Avg: 143.58790902304597 (1.0000) <0-01:15:48> 
+Ep:      96, Reward: 556.4139595985188 [250.902], Avg: 147.84384768877248 (1.0000) <0-01:16:34> 
+Ep:      97, Reward: 576.353416083703 [169.650], Avg: 152.2163943050473 (1.0000) <0-01:17:21> 
+Ep:      98, Reward: 563.1707534597285 [214.812], Avg: 156.36744843792286 (1.0000) <0-01:18:08> 
+Ep:      99, Reward: 619.7609791062201 [224.590], Avg: 161.00138374460582 (1.0000) <0-01:18:54> 
+Ep:     100, Reward: 620.5095799134642 [220.451], Avg: 165.5509698452876 (1.0000) <0-01:19:40> 
+Ep:     101, Reward: 681.7861563744079 [174.528], Avg: 170.61209912498484 (1.0000) <0-01:20:27> 
+Ep:     102, Reward: 526.6822528628861 [217.353], Avg: 174.06909090884798 (1.0000) <0-01:21:12> 
+Ep:     103, Reward: 606.7055641356579 [180.706], Avg: 178.22905699756728 (1.0000) <0-01:21:56> 
+Ep:     104, Reward: 538.0767501609268 [264.500], Avg: 181.65617788483738 (1.0000) <0-01:22:46> 
+Ep:     105, Reward: 625.1719554830664 [209.557], Avg: 185.84028899425462 (1.0000) <0-01:23:33> 
+Ep:     106, Reward: 604.267370020704 [250.951], Avg: 189.75082246179156 (1.0000) <0-01:24:19> 
+Ep:     107, Reward: 624.6128856256187 [254.084], Avg: 193.7773230466418 (1.0000) <0-01:25:04> 
+Ep:     108, Reward: 509.5102304753814 [210.897], Avg: 196.67395522488712 (1.0000) <0-01:25:50> 
+Ep:     109, Reward: 662.5073590900314 [220.414], Avg: 200.9088043509339 (1.0000) <0-01:26:38> 
+Ep:     110, Reward: 578.3188598788283 [247.491], Avg: 204.3088949412753 (1.0000) <0-01:27:24> 
+Ep:     111, Reward: 679.7072150636907 [217.872], Avg: 208.55352279951117 (1.0000) <0-01:28:11> 
+Ep:     112, Reward: 653.9684321668627 [233.138], Avg: 212.49524766116912 (1.0000) <0-01:28:59> 
+Ep:     113, Reward: 723.7577895974592 [264.157], Avg: 216.98000680096115 (1.0000) <0-01:29:45> 
+Ep:     114, Reward: 588.9398186686192 [229.988], Avg: 220.21443994763644 (1.0000) <0-01:30:32> 
+Ep:     115, Reward: 714.6826358143668 [172.735], Avg: 224.47709680855652 (1.0000) <0-01:31:20> 
+Ep:     116, Reward: 555.7526978603762 [216.542], Avg: 227.3085122021618 (1.0000) <0-01:32:06> 
+Ep:     117, Reward: 600.0795351889493 [224.505], Avg: 230.46758866815154 (1.0000) <0-01:32:53> 
+Ep:     118, Reward: 621.8618729034978 [156.647], Avg: 233.75661626676788 (1.0000) <0-01:33:40> 
+Ep:     119, Reward: 726.0430211566775 [236.067], Avg: 237.85900297418382 (1.0000) <0-01:34:26> 
+Ep:     120, Reward: 805.704161779919 [149.530], Avg: 242.5519381709254 (1.0000) <0-01:35:13> 
+Ep:     121, Reward: 808.6285251178952 [248.352], Avg: 247.1919101950809 (1.0000) <0-01:36:00> 
+Ep:     122, Reward: 716.6868467338131 [245.509], Avg: 251.00894219946085 (1.0000) <0-01:36:44> 
+Ep:     123, Reward: 769.7813258339021 [172.126], Avg: 255.1925904545773 (1.0000) <0-01:37:33> 
+Ep:     124, Reward: 711.4725220146387 [151.694], Avg: 258.8428299070578 (1.0000) <0-01:38:17> 
+Ep:     125, Reward: 753.022033914905 [227.029], Avg: 262.76488708172326 (1.0000) <0-01:39:05> 
+Ep:     126, Reward: 702.4994298052179 [157.524], Avg: 266.2273637960815 (1.0000) <0-01:39:53> 
+Ep:     127, Reward: 745.382737644004 [168.966], Avg: 269.97076515426835 (1.0000) <0-01:40:39> 
+Ep:     128, Reward: 684.1846504125695 [187.564], Avg: 273.181725505108 (1.0000) <0-01:41:26> 
+Ep:     129, Reward: 786.4946277889449 [94.197], Avg: 277.1302862919067 (1.0000) <0-01:42:12> 
+Ep:     130, Reward: 722.7479939744746 [163.583], Avg: 280.53194818261335 (1.0000) <0-01:42:59> 
+Ep:     131, Reward: 811.8817403104458 [193.959], Avg: 284.557325395703 (1.0000) <0-01:43:46> 
+Ep:     132, Reward: 641.3249835796626 [242.134], Avg: 287.23978899107107 (1.0000) <0-01:44:32> 
+Ep:     133, Reward: 656.1415011988315 [194.959], Avg: 289.9927868433678 (1.0000) <0-01:45:19> 
+Ep:     134, Reward: 635.8947557658988 [253.162], Avg: 292.55502365020135 (1.0000) <0-01:46:05> 
+Ep:     135, Reward: 631.1938429361769 [225.198], Avg: 295.0450149684806 (1.0000) <0-01:46:52> 
+Ep:     136, Reward: 615.4476787253928 [224.934], Avg: 297.38372054334855 (1.0000) <0-01:47:38> 
+Ep:     137, Reward: 656.2279013007219 [198.167], Avg: 299.9840406937643 (1.0000) <0-01:48:24> 
+Ep:     138, Reward: 678.8157771799499 [159.408], Avg: 302.7094488699239 (1.0000) <0-01:49:11> 
+Ep:     139, Reward: 633.952835870153 [187.234], Avg: 305.0754730627827 (1.0000) <0-01:49:57> 
+Ep:     140, Reward: 599.9003529904087 [219.219], Avg: 307.16642965801407 (1.0000) <0-01:50:43> 
+Ep:     141, Reward: 618.1413950067789 [225.550], Avg: 309.35639420272366 (1.0000) <0-01:51:30> 
+Ep:     142, Reward: 724.1759282898314 [204.538], Avg: 312.2572301054308 (1.0000) <0-01:52:18> 
+Ep:     143, Reward: 731.4233143930608 [178.650], Avg: 315.1681056907615 (1.0000) <0-01:53:04> 
+Ep:     144, Reward: 771.9240344838195 [115.934], Avg: 318.31814657898946 (1.0000) <0-01:53:51> 
+Ep:     145, Reward: 768.2854990259066 [217.355], Avg: 321.4001147464341 (1.0000) <0-01:54:37> 
+Ep:     146, Reward: 707.9332853510404 [177.806], Avg: 324.0295920974859 (1.0000) <0-01:55:24> 
+Ep:     147, Reward: 722.3378916681952 [187.989], Avg: 326.72086439188257 (1.0000) <0-01:56:11> 
+Ep:     148, Reward: 740.1061648309719 [175.857], Avg: 329.49526238140663 (1.0000) <0-01:57:00> 
+Ep:     149, Reward: 780.2688122139066 [209.318], Avg: 332.50041938028994 (1.0000) <0-01:57:47> 
+Ep:     150, Reward: 650.3196044243091 [206.765], Avg: 334.60518219515103 (1.0000) <0-01:58:34> 
+Ep:     151, Reward: 695.4215263101091 [200.580], Avg: 336.97897393274934 (1.0000) <0-01:59:19> 
+Ep:     152, Reward: 627.8617069599277 [223.870], Avg: 338.88016826626034 (1.0000) <0-02:00:07> 
+Ep:     153, Reward: 778.4118893217772 [139.283], Avg: 341.7342703510364 (1.0000) <0-02:00:53> 
+Ep:     154, Reward: 693.3286773864604 [249.121], Avg: 344.0026213641682 (1.0000) <0-02:01:37> 
+Ep:     155, Reward: 765.995331487036 [226.287], Avg: 346.7077028393148 (1.0000) <0-02:02:26> 
+Ep:     156, Reward: 597.9797935735955 [248.865], Avg: 348.3081620159663 (1.0000) <0-02:03:11> 
+Ep:     157, Reward: 594.3782241380568 [236.413], Avg: 349.86556747243515 (1.0000) <0-02:03:58> 
+Ep:     158, Reward: 696.2183410549187 [193.185], Avg: 352.0438868031426 (1.0000) <0-02:04:45> 
+Ep:     159, Reward: 649.405252072336 [234.251], Avg: 353.9023953360751 (1.0000) <0-02:05:32> 
+Ep:     160, Reward: 717.803250954938 [132.409], Avg: 356.16264909768296 (1.0000) <0-02:06:18> 
+Ep:     161, Reward: 658.6940576343836 [136.122], Avg: 358.0301269281564 (1.0000) <0-02:07:05> 
+Ep:     162, Reward: 676.1289395064553 [215.366], Avg: 359.98165338569197 (1.0000) <0-02:07:52> 
+Ep:     163, Reward: 716.8829694341028 [161.010], Avg: 362.15788092257253 (1.0000) <0-02:08:39> 
+Ep:     164, Reward: 738.2531713466353 [172.277], Avg: 364.437246319082 (1.0000) <0-02:09:26> 
+Ep:     165, Reward: 697.1599754815227 [160.030], Avg: 366.44160010921723 (1.0000) <0-02:10:13> 
+Ep:     166, Reward: 692.5406802083328 [176.798], Avg: 368.3942892116071 (1.0000) <0-02:10:59> 
+Ep:     167, Reward: 808.3401315831852 [78.281], Avg: 371.0130144638189 (1.0000) <0-02:11:46> 
+Ep:     168, Reward: 761.3808439301331 [176.022], Avg: 373.322883277229 (1.0000) <0-02:12:33> 
+Ep:     169, Reward: 825.0875074991975 [112.642], Avg: 375.9803222432406 (1.0000) <0-02:13:19> 
+Ep:     170, Reward: 637.7420466196162 [198.960], Avg: 377.51109256123107 (1.0000) <0-02:14:06> 
+Ep:     171, Reward: 676.5768197803271 [214.753], Avg: 379.2498467892491 (1.0000) <0-02:14:53> 
+Ep:     172, Reward: 727.5562688369841 [231.120], Avg: 381.26317870860015 (1.0000) <0-02:15:39> 
+Ep:     173, Reward: 686.6010689514292 [189.077], Avg: 383.01799416976587 (1.0000) <0-02:16:25> 
+Ep:     174, Reward: 613.103274514651 [275.822], Avg: 384.33276720030807 (1.0000) <0-02:17:11> 
+Ep:     175, Reward: 713.833284947417 [206.455], Avg: 386.20492923296206 (1.0000) <0-02:17:58> 
+Ep:     176, Reward: 657.3743388314135 [206.986], Avg: 387.7369597956652 (1.0000) <0-02:18:44> 
+Ep:     177, Reward: 703.7815993927732 [202.657], Avg: 389.51249147879497 (1.0000) <0-02:19:31> 
+Ep:     178, Reward: 686.7522685267331 [176.459], Avg: 391.1730488924706 (1.0000) <0-02:20:17> 
+Ep:     179, Reward: 653.973225931333 [219.007], Avg: 392.6330498760198 (1.0000) <0-02:21:04> 
+Ep:     180, Reward: 710.6311145262446 [222.971], Avg: 394.3899452608277 (1.0000) <0-02:21:50> 
+Ep:     181, Reward: 593.7148116988482 [214.346], Avg: 395.485136834663 (1.0000) <0-02:22:37> 
+Ep:     182, Reward: 606.5657724281541 [275.754], Avg: 396.6385829308023 (1.0000) <0-02:23:23> 
+Ep:     183, Reward: 692.5193011657943 [209.419], Avg: 398.2466303125143 (1.0000) <0-02:24:10> 
+Ep:     184, Reward: 686.4187134412573 [158.058], Avg: 399.8043172483453 (1.0000) <0-02:24:57> 
+Ep:     185, Reward: 697.5652807644344 [214.593], Avg: 401.4051826435931 (1.0000) <0-02:25:46> 
+Ep:     186, Reward: 638.2179161075173 [222.375], Avg: 402.67156089741087 (1.0000) <0-02:26:33> 
+Ep:     187, Reward: 800.2172382802447 [111.902], Avg: 404.7861655643408 (1.0000) <0-02:27:20> 
+Ep:     188, Reward: 755.1232048955635 [209.493], Avg: 406.6398006930774 (1.0000) <0-02:28:06> 
+Ep:     189, Reward: 689.0963477003243 [188.254], Avg: 408.1264140983787 (1.0000) <0-02:28:53> 
+Ep:     190, Reward: 699.1111249660621 [224.247], Avg: 409.6498942599896 (1.0000) <0-02:29:40> 
+Ep:     191, Reward: 603.972430843105 [210.484], Avg: 410.6619908046934 (1.0000) <0-02:30:27> 
+Ep:     192, Reward: 644.8319778230905 [188.182], Avg: 411.87530679960736 (1.0000) <0-02:31:14> 
+Ep:     193, Reward: 677.9768380134218 [174.046], Avg: 413.2469641769982 (1.0000) <0-02:32:01> 
+Ep:     194, Reward: 745.0328670499284 [171.777], Avg: 414.9484303455773 (1.0000) <0-02:32:50> 
+Ep:     195, Reward: 782.060075167454 [178.732], Avg: 416.8214489416073 (1.0000) <0-02:33:36> 
+Ep:     196, Reward: 779.4614366460833 [132.669], Avg: 418.6622610619346 (1.0000) <0-02:34:23> 
+Ep:     197, Reward: 753.2602702972642 [147.508], Avg: 420.35214999746654 (1.0000) <0-02:35:09> 
+Ep:     198, Reward: 776.2907485427911 [109.101], Avg: 422.1407861710611 (1.0000) <0-02:35:55> 
+Ep:     199, Reward: 710.2696717751114 [197.178], Avg: 423.58143059908144 (1.0000) <0-02:36:42> 
+Ep:     200, Reward: 818.2579499363156 [128.622], Avg: 425.5449953719035 (1.0000) <0-02:37:29> 
+Ep:     201, Reward: 806.1934042321564 [156.959], Avg: 427.4293934355681 (1.0000) <0-02:38:16> 
+Ep:     202, Reward: 804.0935511970245 [109.623], Avg: 429.28488189744724 (1.0000) <0-02:39:03> 
+Ep:     203, Reward: 788.8954679705703 [164.307], Avg: 431.0476788880017 (1.0000) <0-02:39:50> 
+Ep:     204, Reward: 835.9853909389806 [156.659], Avg: 433.0229848004455 (1.0000) <0-02:40:37> 
+Ep:     205, Reward: 838.5191690235681 [105.090], Avg: 434.99141287919855 (1.0000) <0-02:41:24> 
+Ep:     206, Reward: 869.9567299728611 [42.608], Avg: 437.09269460428874 (1.0000) <0-02:42:11> 
+Ep:     207, Reward: 952.2827185611654 [155.486], Avg: 439.5695697194659 (1.0000) <0-02:42:58> 
+Ep:     208, Reward: 867.6974858980576 [166.757], Avg: 441.6180286485501 (1.0000) <0-02:43:44> 
+Ep:     209, Reward: 830.6225579719624 [116.825], Avg: 443.4704311691377 (1.0000) <0-02:44:31> 
+Ep:     210, Reward: 893.5086419066063 [96.279], Avg: 445.6033136844812 (1.0000) <0-02:45:20> 
+Ep:     211, Reward: 732.5972474170107 [268.151], Avg: 446.9570586549177 (1.0000) <0-02:46:07> 
+Ep:     212, Reward: 823.4108097623941 [195.494], Avg: 448.7244471577697 (1.0000) <0-02:46:53> 
+Ep:     213, Reward: 688.9819174915446 [257.992], Avg: 449.84714561727327 (1.0000) <0-02:47:41> 
+Ep:     214, Reward: 817.1663752457554 [103.090], Avg: 451.555607150429 (1.0000) <0-02:48:29> 
+Ep:     215, Reward: 870.4781968803532 [115.319], Avg: 453.4950635843639 (1.0000) <0-02:49:18> 
+Ep:     216, Reward: 786.2812796231468 [170.869], Avg: 455.0286406168006 (1.0000) <0-02:50:05> 
+Ep:     217, Reward: 779.3447634229151 [115.464], Avg: 456.5163292535259 (1.0000) <0-02:50:53> 
+Ep:     218, Reward: 906.5826012378697 [199.093], Avg: 458.5714263858745 (1.0000) <0-02:51:40> 
+Ep:     219, Reward: 762.4871465717267 [198.739], Avg: 459.95286147762846 (1.0000) <0-02:52:26> 
+Ep:     220, Reward: 874.5744088739275 [171.442], Avg: 461.8289770767067 (1.0000) <0-02:53:14> 
+Ep:     221, Reward: 916.1908284242645 [121.962], Avg: 463.87565208277675 (1.0000) <0-02:54:01> 
+Ep:     222, Reward: 853.3704347667809 [231.225], Avg: 465.62226545804134 (1.0000) <0-02:54:48> 
+Ep:     223, Reward: 829.6771851403631 [200.808], Avg: 467.24751063519477 (1.0000) <0-02:55:35> 
+Ep:     224, Reward: 855.1063573848083 [204.726], Avg: 468.9713277318596 (1.0000) <0-02:56:22> 
+Ep:     225, Reward: 873.0295083281865 [171.567], Avg: 470.75919578759556 (1.0000) <0-02:57:09> 
+Ep:     226, Reward: 817.387732983178 [208.657], Avg: 472.28619374880964 (1.0000) <0-02:57:56> 
+Ep:     227, Reward: 877.3821049877743 [132.799], Avg: 474.0629302016121 (1.0000) <0-02:58:44> 
+Ep:     228, Reward: 744.9819132001292 [233.604], Avg: 475.2459825291165 (1.0000) <0-02:59:31> 
+Ep:     229, Reward: 800.7617234733584 [234.390], Avg: 476.6612683593089 (1.0000) <0-03:00:20> 
+Ep:     230, Reward: 841.8202216107682 [184.653], Avg: 478.2420430487092 (1.0000) <0-03:01:07> 
+Ep:     231, Reward: 748.5841012562232 [197.128], Avg: 479.40731054098296 (1.0000) <0-03:01:55> 
+Ep:     232, Reward: 849.0890115785141 [105.040], Avg: 480.99392728363324 (1.0000) <0-03:02:40> 
+Ep:     233, Reward: 854.5076707121121 [145.901], Avg: 482.5901398623875 (1.0000) <0-03:03:28> 
+Ep:     234, Reward: 829.3596975808501 [167.449], Avg: 484.06575500161495 (1.0000) <0-03:04:15> 
+Ep:     235, Reward: 881.2998198994544 [155.654], Avg: 485.74895019186005 (1.0000) <0-03:05:02> 
+Ep:     236, Reward: 786.5059143832277 [202.087], Avg: 487.017966918406 (1.0000) <0-03:05:49> 
+Ep:     237, Reward: 883.0521749750128 [225.000], Avg: 488.6819761959548 (1.0000) <0-03:06:36> 
+Ep:     238, Reward: 761.4233959421454 [197.025], Avg: 489.82315368443255 (1.0000) <0-03:07:23> 
+Ep:     239, Reward: 851.791963346949 [204.581], Avg: 491.3313570580262 (1.0000) <0-03:08:10> 
+Ep:     240, Reward: 758.6384092381268 [164.043], Avg: 492.44051495088974 (1.0000) <0-03:08:56> 
+Ep:     241, Reward: 753.864049539 [229.563], Avg: 493.52077749051 (1.0000) <0-03:09:43> 
+Ep:     242, Reward: 724.0496276524987 [200.800], Avg: 494.4694558862383 (1.0000) <0-03:10:29> 
+Ep:     243, Reward: 770.5927692146342 [162.872], Avg: 495.60110880971536 (1.0000) <0-03:11:16> 
+Ep:     244, Reward: 746.5792430276999 [192.505], Avg: 496.6255093575439 (1.0000) <0-03:12:03> 
+Ep:     245, Reward: 785.3612017635794 [207.158], Avg: 497.7992316843977 (1.0000) <0-03:12:50> 
+Ep:     246, Reward: 809.4442165488955 [193.591], Avg: 499.06095227089367 (1.0000) <0-03:13:36> 
+Ep:     247, Reward: 735.5412857976656 [182.164], Avg: 500.01450200285643 (1.0000) <0-03:14:22> 
+Ep:     248, Reward: 862.4128039072758 [157.951], Avg: 501.46991686994244 (1.0000) <0-03:15:09> 
+Ep:     249, Reward: 797.4249154267252 [207.522], Avg: 502.6537368641696 (1.0000) <0-03:15:55> 
+Ep:     250, Reward: 829.941374858199 [93.671], Avg: 503.9576716768948 (1.0000) <0-03:16:42> 
+Ep:     251, Reward: 777.8495727729087 [168.674], Avg: 505.0445443002917 (1.0000) <0-03:17:29> 
+Ep:     252, Reward: 826.5033045916421 [130.869], Avg: 506.315132285633 (1.0000) <0-03:18:15> 
+Ep:     253, Reward: 846.7440074507755 [163.292], Avg: 507.65540344770045 (1.0000) <0-03:19:02> 
+Ep:     254, Reward: 901.4247755083163 [87.272], Avg: 509.1995970636244 (1.0000) <0-03:19:49> 
+Ep:     255, Reward: 862.1787827067158 [57.690], Avg: 510.5784220075427 (1.0000) <0-03:20:34> 
+Ep:     256, Reward: 865.762289640171 [136.437], Avg: 511.9604604030005 (1.0000) <0-03:21:22> 
+Ep:     257, Reward: 872.3258432519449 [153.167], Avg: 513.3572254528026 (1.0000) <0-03:22:07> 
+Ep:     258, Reward: 845.794892405174 [104.516], Avg: 514.6407685684488 (1.0000) <0-03:22:55> 
+Ep:     259, Reward: 784.774069295421 [237.951], Avg: 515.6797428020141 (1.0000) <0-03:23:40> 
+Ep:     260, Reward: 883.4832140906149 [265.044], Avg: 517.0889515042692 (1.0000) <0-03:24:25> 
+Ep:     261, Reward: 762.8785659345642 [190.301], Avg: 518.0270798036215 (1.0000) <0-03:25:09> 
+Ep:     262, Reward: 807.0992231691524 [228.686], Avg: 519.1262134285855 (1.0000) <0-03:25:54> 
+Ep:     263, Reward: 801.3789378606231 [182.672], Avg: 520.1953525362826 (1.0000) <0-03:26:36> 
+Ep:     264, Reward: 854.6149862768301 [193.686], Avg: 521.4573134183224 (1.0000) <0-03:27:23> 
+Ep:     265, Reward: 855.2287639808128 [185.055], Avg: 522.7120933076552 (1.0000) <0-03:28:08> 
+Ep:     266, Reward: 851.3326934625836 [166.899], Avg: 523.9428820722803 (1.0000) <0-03:28:53> 
+Ep:     267, Reward: 840.9565739904338 [107.488], Avg: 525.1257689824228 (1.0000) <0-03:29:38> 
+Ep:     268, Reward: 825.4204228252408 [108.892], Avg: 526.2421059855559 (1.0000) <0-03:30:23> 
+Ep:     269, Reward: 870.8205788547166 [205.941], Avg: 527.5183225517379 (1.0000) <0-03:31:08> 
+Ep:     270, Reward: 777.318535375259 [174.237], Avg: 528.4400945547767 (1.0000) <0-03:31:53> 
+Ep:     271, Reward: 866.2894689893935 [94.321], Avg: 529.6821878431392 (1.0000) <0-03:32:37> 
+Ep:     272, Reward: 774.8241355505119 [260.333], Avg: 530.5801436955473 (1.0000) <0-03:33:22> 
+Ep:     273, Reward: 773.7625716943268 [232.711], Avg: 531.467670805032 (1.0000) <0-03:34:07> 
+Ep:     274, Reward: 681.8221603272423 [264.328], Avg: 532.0144144032944 (1.0000) <0-03:34:52> 
+Ep:     275, Reward: 832.3767153157573 [143.830], Avg: 533.1026836094991 (1.0000) <0-03:35:38> 
+Ep:     276, Reward: 743.0205083052723 [221.539], Avg: 533.8605096914332 (1.0000) <0-03:36:22> 
+Ep:     277, Reward: 743.6455834998378 [253.073], Avg: 534.6151322590894 (1.0000) <0-03:37:08> 
+Ep:     278, Reward: 751.9758653925492 [198.896], Avg: 535.3942029871663 (1.0000) <0-03:37:54> 
+Ep:     279, Reward: 701.757710751403 [196.346], Avg: 535.9883583720384 (1.0000) <0-03:38:39> 
+Ep:     280, Reward: 848.2475116374746 [111.540], Avg: 537.0996009103497 (1.0000) <0-03:39:24> 
+Ep:     281, Reward: 825.1976977556554 [213.052], Avg: 538.121225367248 (1.0000) <0-03:40:07> 
+Ep:     282, Reward: 816.6107500142776 [223.081], Avg: 539.1052872917957 (1.0000) <0-03:40:51> 
+Ep:     283, Reward: 774.2153165988992 [262.489], Avg: 539.9331395076658 (1.0000) <0-03:41:37> 
+Ep:     284, Reward: 726.2505109927362 [223.726], Avg: 540.5868846707714 (1.0000) <0-03:42:22> 
+Ep:     285, Reward: 868.7271718190462 [158.562], Avg: 541.7342283321289 (1.0000) <0-03:43:07> 
+Ep:     286, Reward: 825.2739702188944 [212.682], Avg: 542.7221716836507 (1.0000) <0-03:43:52> 
+Ep:     287, Reward: 792.6272386551507 [244.144], Avg: 543.5898976106351 (1.0000) <0-03:44:39> 
+Ep:     288, Reward: 778.3372033870418 [227.896], Avg: 544.4021720250863 (1.0000) <0-03:45:26> 
+Ep:     289, Reward: 725.1301813419196 [291.910], Avg: 545.0253720572134 (1.0000) <0-03:46:12> 
+Ep:     290, Reward: 699.297640883077 [227.746], Avg: 545.5555173109105 (1.0000) <0-03:47:00> 
+Ep:     291, Reward: 882.7607377363753 [131.296], Avg: 546.7103297096278 (1.0000) <0-03:47:46> 
+Ep:     292, Reward: 762.7184087034957 [226.844], Avg: 547.4475586481735 (1.0000) <0-03:48:31> 
+Ep:     293, Reward: 867.0893416560881 [215.246], Avg: 548.53477559718 (1.0000) <0-03:49:20> 
+Ep:     294, Reward: 768.2948202993057 [208.830], Avg: 549.279724901255 (1.0000) <0-03:50:07> 
+Ep:     295, Reward: 731.5327063071059 [257.973], Avg: 549.8954444330316 (1.0000) <0-03:50:53> 
+Ep:     296, Reward: 765.3867754208899 [93.445], Avg: 550.6210044700276 (1.0000) <0-03:51:40> 
+Ep:     297, Reward: 658.3833537076723 [181.871], Avg: 550.9826230916304 (1.0000) <0-03:52:27> 
+Ep:     298, Reward: 605.7488182260433 [228.207], Avg: 551.1657876238526 (1.0000) <0-03:53:13> 
+Ep:     299, Reward: 627.4228601054642 [230.246], Avg: 551.419977865458 (1.0000) <0-03:54:00> 
+Ep:     300, Reward: 699.7109088132365 [245.715], Avg: 551.9126387656167 (1.0000) <0-03:54:46> 
+Ep:     301, Reward: 702.9173959631469 [262.069], Avg: 552.4126545179264 (1.0000) <0-03:55:33> 
+Ep:     302, Reward: 673.2255899741559 [214.289], Avg: 552.8113770771879 (1.0000) <0-03:56:20> 
+Ep:     303, Reward: 727.7620781087799 [170.472], Avg: 553.3868728042655 (1.0000) <0-03:57:07> 
+Ep:     304, Reward: 811.4837267833143 [152.829], Avg: 554.2330919976393 (1.0000) <0-03:57:54> 
+Ep:     305, Reward: 746.419460663762 [120.169], Avg: 554.8611520259601 (1.0000) <0-03:58:41> 
+Ep:     306, Reward: 798.0991362173322 [158.631], Avg: 555.6534581633913 (1.0000) <0-03:59:28> 
+Ep:     307, Reward: 857.880950787666 [138.361], Avg: 556.6347162563272 (1.0000) <0-04:00:14> 
+Ep:     308, Reward: 843.3248275739858 [165.699], Avg: 557.5625159693294 (1.0000) <0-04:01:01> 
+Ep:     309, Reward: 854.3054635636099 [107.280], Avg: 558.5197512841496 (1.0000) <0-04:01:48> 
+Ep:     310, Reward: 817.0113439534224 [204.706], Avg: 559.3509139615428 (1.0000) <0-04:02:36> 
+Ep:     311, Reward: 764.5355595397248 [256.315], Avg: 560.0085570563447 (1.0000) <0-04:03:22> 
+Ep:     312, Reward: 780.3468401400482 [181.682], Avg: 560.7125132323309 (1.0000) <0-04:04:10> 
+Ep:     313, Reward: 845.4699341622154 [35.597], Avg: 561.6193839996236 (1.0000) <0-04:04:57> 
+Ep:     314, Reward: 759.8470831646133 [202.062], Avg: 562.248678282687 (1.0000) <0-04:05:45> 
+Ep:     315, Reward: 799.9612998640083 [210.497], Avg: 563.0009334142735 (1.0000) <0-04:06:31> 
+Ep:     316, Reward: 818.918488780432 [212.517], Avg: 563.8082443144822 (1.0000) <0-04:07:18> 
+Ep:     317, Reward: 809.7272532060122 [204.759], Avg: 564.5815745311222 (1.0000) <0-04:08:05> 
+Ep:     318, Reward: 873.254341894693 [132.391], Avg: 565.549200761102 (1.0000) <0-04:08:52> 
+Ep:     319, Reward: 806.1024729104968 [160.403], Avg: 566.300929736569 (1.0000) <0-04:09:39> 
+Ep:     320, Reward: 767.6425070603452 [261.101], Avg: 566.9281620646804 (1.0000) <0-04:10:27> 
+Ep:     321, Reward: 716.7235777931093 [233.177], Avg: 567.3933652191165 (1.0000) <0-04:11:13> 
+Ep:     322, Reward: 879.729371125856 [149.375], Avg: 568.3603497575275 (1.0000) <0-04:12:01> 
+Ep:     323, Reward: 817.7253161823364 [189.509], Avg: 569.1299947156288 (1.0000) <0-04:12:48> 
+Ep:     324, Reward: 854.4497297068743 [166.855], Avg: 570.007901592525 (1.0000) <0-04:13:35> 
+Ep:     325, Reward: 802.17797732029 [157.203], Avg: 570.720079738929 (1.0000) <0-04:14:20> 
+Ep:     326, Reward: 812.8663125608272 [163.916], Avg: 571.4605880961825 (1.0000) <0-04:15:09> 
+Ep:     327, Reward: 857.6914028281232 [135.238], Avg: 572.3332430191458 (1.0000) <0-04:15:56> 
+Ep:     328, Reward: 789.356948816874 [200.476], Avg: 572.9928895413274 (1.0000) <0-04:16:43> 
+Ep:     329, Reward: 789.8561186355332 [155.425], Avg: 573.6500508416127 (1.0000) <0-04:17:28> 
+Ep:     330, Reward: 802.9881909338551 [201.776], Avg: 574.3429153131906 (1.0000) <0-04:18:15> 
+Ep:     331, Reward: 785.1244774411691 [267.651], Avg: 574.9777995364676 (1.0000) <0-04:19:05> 
+Ep:     332, Reward: 812.0289619462782 [221.687], Avg: 575.6896648890497 (1.0000) <0-04:19:53> 
+Ep:     333, Reward: 821.1797500033227 [155.791], Avg: 576.4246651438829 (1.0000) <0-04:20:41> 
+Ep:     334, Reward: 818.2891218179906 [191.253], Avg: 577.1466485966413 (1.0000) <0-04:21:30> 
+Ep:     335, Reward: 861.7804793522869 [18.527], Avg: 577.9937730929379 (1.0000) <0-04:22:17> 
+Ep:     336, Reward: 880.3202850199007 [98.350], Avg: 578.890884404294 (1.0000) <0-04:23:04> 
+Ep:     337, Reward: 882.3326637709717 [202.484], Avg: 579.7886411479823 (1.0000) <0-04:23:51> 
+Ep:     338, Reward: 914.5191665671625 [184.782], Avg: 580.7760468276849 (1.0000) <0-04:24:38> 
+Ep:     339, Reward: 908.8613327901469 [124.531], Avg: 581.7410035511037 (1.0000) <0-04:25:24> 
+Ep:     340, Reward: 857.6644920751762 [204.797], Avg: 582.550163341497 (1.0000) <0-04:26:11> 
+Ep:     341, Reward: 910.0091859806759 [175.154], Avg: 583.5076458638338 (1.0000) <0-04:26:58> 
+Ep:     342, Reward: 937.2071754399451 [120.449], Avg: 584.5388398276125 (1.0000) <0-04:27:44> 
+Ep:     343, Reward: 864.6048994531436 [204.992], Avg: 585.3529853497798 (1.0000) <0-04:28:29> 
+Ep:     344, Reward: 783.5869547904318 [150.447], Avg: 585.9275765655498 (1.0000) <0-04:29:18> 
+Ep:     345, Reward: 702.159143135681 [236.269], Avg: 586.2635059487005 (1.0000) <0-04:30:05> 
+Ep:     346, Reward: 844.0578474100796 [172.888], Avg: 587.0064291229407 (1.0000) <0-04:30:51> 
+Ep:     347, Reward: 799.3963885933902 [112.891], Avg: 587.6167450984306 (1.0000) <0-04:31:35> 
+Ep:     348, Reward: 790.7564587390666 [216.616], Avg: 588.1988073151658 (1.0000) <0-04:32:24> 
+Ep:     349, Reward: 779.2604218281474 [153.994], Avg: 588.7446976423458 (1.0000) <0-04:33:11> 
+Ep:     350, Reward: 825.9294884129583 [156.367], Avg: 589.4204377869914 (1.0000) <0-04:33:57> 
+Ep:     351, Reward: 774.552219346705 [196.591], Avg: 589.9463803482406 (1.0000) <0-04:34:44> 
+Ep:     352, Reward: 819.3149322199674 [84.893], Avg: 590.5961496169991 (1.0000) <0-04:35:31> 
+Ep:     353, Reward: 861.3834877097395 [184.652], Avg: 591.3610856003119 (1.0000) <0-04:36:21> 
+Ep:     354, Reward: 936.4450335807962 [174.647], Avg: 592.3331530594118 (1.0000) <0-04:37:15> 
+Ep:     355, Reward: 894.7933654149433 [154.475], Avg: 593.1827603974891 (1.0000) <0-04:38:10> 
+Ep:     356, Reward: 918.5903519317352 [176.936], Avg: 594.0942662561285 (1.0000) <0-04:39:04> 
+Ep:     357, Reward: 825.0492613028355 [225.248], Avg: 594.7393919406164 (1.0000) <0-04:39:58> 
+Ep:     358, Reward: 806.0893261236763 [117.034], Avg: 595.3281104202351 (1.0000) <0-04:40:52> 
+Ep:     359, Reward: 900.3467419600443 [140.902], Avg: 596.1753843967346 (1.0000) <0-04:41:46> 
+Ep:     360, Reward: 691.9544832956942 [264.208], Avg: 596.4407004601667 (1.0000) <0-04:42:41> 
+Ep:     361, Reward: 791.9788823562017 [229.667], Avg: 596.9808611836363 (1.0000) <0-04:43:30> 
+Ep:     362, Reward: 822.5576861975254 [202.817], Avg: 597.6022849440052 (1.0000) <0-04:44:17> 
+Ep:     363, Reward: 831.9888901446366 [168.556], Avg: 598.2462041890618 (1.0000) <0-04:45:02> 
+Ep:     364, Reward: 817.3984332847772 [111.178], Avg: 598.8466212550775 (1.0000) <0-04:45:52> 
+Ep:     365, Reward: 841.3713825317147 [207.414], Avg: 599.5092572148496 (1.0000) <0-04:46:43> 
+Ep:     366, Reward: 867.23940710192 [175.847], Avg: 600.2387671600461 (1.0000) <0-04:47:37> 
+Ep:     367, Reward: 808.1199044147277 [178.383], Avg: 600.80366155476 (1.0000) <0-04:48:28> 
+Ep:     368, Reward: 871.9899671673924 [188.275], Avg: 601.5385837921925 (1.0000) <0-04:49:17> 
+Ep:     369, Reward: 899.2225554890128 [128.903], Avg: 602.3431350670488 (1.0000) <0-04:50:10> 
+Ep:     370, Reward: 764.0311677530715 [203.514], Avg: 602.7789518667416 (1.0000) <0-04:51:04> 
+Ep:     371, Reward: 912.4474255697877 [132.522], Avg: 603.611394000352 (1.0000) <0-04:51:55> 
+Ep:     372, Reward: 783.3287514636868 [250.714], Avg: 604.0932099721035 (1.0000) <0-04:52:48> 
+Ep:     373, Reward: 716.7708537512055 [179.058], Avg: 604.3944870945076 (1.0000) <0-04:53:42> 
+Ep:     374, Reward: 820.4167799233485 [276.468], Avg: 604.9705465420511 (1.0000) <0-04:54:35> 
+Ep:     375, Reward: 844.8140760801749 [186.837], Avg: 605.608428269546 (1.0000) <0-04:55:28> 
+Ep:     376, Reward: 772.6606016100236 [240.239], Avg: 606.0515374826508 (1.0000) <0-04:56:16> 
+Ep:     377, Reward: 907.5430725821849 [147.891], Avg: 606.8491341363533 (1.0000) <0-04:57:03> 
+Ep:     378, Reward: 893.3988434387238 [213.769], Avg: 607.6052019709242 (1.0000) <0-04:57:50> 
+Ep:     379, Reward: 790.575973935763 [191.080], Avg: 608.0867040024106 (1.0000) <0-04:58:44> 
+Ep:     380, Reward: 906.822405499217 [240.425], Avg: 608.870787208439 (1.0000) <0-04:59:39> 
+Ep:     381, Reward: 802.6666728982289 [215.020], Avg: 609.3781062809253 (1.0000) <0-05:00:34> 
+Ep:     382, Reward: 858.3688823067339 [107.002], Avg: 610.0282127457447 (1.0000) <0-05:01:28> 
+Ep:     383, Reward: 808.0243763917733 [232.121], Avg: 610.5438277552395 (1.0000) <0-05:02:22> 
+Ep:     384, Reward: 808.2617149616148 [360.408], Avg: 611.0573807090223 (1.0000) <0-05:03:16> 
+Ep:     385, Reward: 779.6444911275155 [245.462], Avg: 611.494134881091 (1.0000) <0-05:04:08> 
+Ep:     386, Reward: 795.6392715044315 [117.557], Avg: 611.9699621075079 (1.0000) <0-05:05:04> 
+Ep:     387, Reward: 844.2784713790157 [33.266], Avg: 612.5686953788262 (1.0000) <0-05:05:59> 
+Ep:     388, Reward: 794.8882792929014 [305.396], Avg: 613.037383255212 (1.0000) <0-05:06:54> 
+Ep:     389, Reward: 819.602281792992 [140.260], Avg: 613.5670368412062 (1.0000) <0-05:07:48> 
+Ep:     390, Reward: 787.66044335385 [172.803], Avg: 614.0122885202668 (1.0000) <0-05:08:41> 
+Ep:     391, Reward: 869.6810862230448 [230.112], Avg: 614.6645048409371 (1.0000) <0-05:09:34> 
+Ep:     392, Reward: 786.1507454359511 [224.242], Avg: 615.1008565981763 (1.0000) <0-05:10:28> 
+Ep:     393, Reward: 851.770610463715 [148.146], Avg: 615.7015412526574 (1.0000) <0-05:11:22> 
+Ep:     394, Reward: 723.8644843625324 [224.081], Avg: 615.9753714883786 (1.0000) <0-05:12:16> 
+Ep:     395, Reward: 781.0942367586706 [108.564], Avg: 616.3923383198692 (1.0000) <0-05:13:07> 
+Ep:     396, Reward: 704.466487825499 [205.636], Avg: 616.6141875629564 (1.0000) <0-05:13:59> 
+Ep:     397, Reward: 787.055619646002 [220.988], Avg: 617.0424323671851 (1.0000) <0-05:14:52> 
+Ep:     398, Reward: 842.0176927030932 [167.745], Avg: 617.6062801374507 (1.0000) <0-05:15:46> 
+Ep:     399, Reward: 695.6024438555896 [249.949], Avg: 617.801270546746 (1.0000) <0-05:16:41> 
+Ep:     400, Reward: 897.1930994459146 [124.211], Avg: 618.4980082746741 (1.0000) <0-05:17:35> 
+Ep:     401, Reward: 800.267801603097 [204.597], Avg: 618.9501719396701 (1.0000) <0-05:18:28> 
+Ep:     402, Reward: 789.5763946691127 [151.634], Avg: 619.3735620705124 (1.0000) <0-05:19:22> 
+Ep:     403, Reward: 804.8336375633548 [226.806], Avg: 619.8326216633166 (1.0000) <0-05:20:16> 
+Ep:     404, Reward: 723.4132164252994 [248.467], Avg: 620.0883762182843 (1.0000) <0-05:21:07> 
+Ep:     405, Reward: 835.5181799275238 [122.661], Avg: 620.6189914983564 (1.0000) <0-05:22:04> 
+Ep:     406, Reward: 793.0225914346255 [148.368], Avg: 621.042587566996 (1.0000) <0-05:22:52> 
+Ep:     407, Reward: 813.7948842145538 [124.674], Avg: 621.5150196666223 (1.0000) <0-05:23:36> 
+Ep:     408, Reward: 927.3354784970447 [165.275], Avg: 622.2627469498261 (1.0000) <0-05:24:21> 
+Ep:     409, Reward: 796.249287814308 [145.519], Avg: 622.6871043665689 (1.0000) <0-05:25:06> 
+Ep:     410, Reward: 743.6937506401948 [153.521], Avg: 622.9815244304949 (1.0000) <0-05:25:51> 
+Ep:     411, Reward: 838.3290356052203 [178.054], Avg: 623.5042125644143 (1.0000) <0-05:26:43> 
+Ep:     412, Reward: 719.3692196635789 [251.865], Avg: 623.7363312256712 (1.0000) <0-05:27:33> 
+Ep:     413, Reward: 730.4952729725155 [194.550], Avg: 623.9942030656395 (1.0000) <0-05:28:26> 
+Ep:     414, Reward: 875.254764919455 [223.990], Avg: 624.5996502026366 (1.0000) <0-05:29:17> 
+Ep:     415, Reward: 645.0930391421562 [277.540], Avg: 624.648913156818 (1.0000) <0-05:30:09> 
+Ep:     416, Reward: 822.9288769695653 [188.923], Avg: 625.1244046767528 (1.0000) <0-05:31:00> 
+Ep:     417, Reward: 756.6024374034026 [220.812], Avg: 625.4389454249026 (1.0000) <0-05:31:48> 
+Ep:     418, Reward: 761.1056073568095 [169.065], Avg: 625.7627322075563 (1.0000) <0-05:32:33> 
+Ep:     419, Reward: 793.6159476637918 [146.663], Avg: 626.1623827205475 (1.0000) <0-05:33:18> 
+Ep:     420, Reward: 869.2784434939258 [183.623], Avg: 626.7398555489877 (1.0000) <0-05:34:06> 
+Ep:     421, Reward: 819.1967428566284 [231.844], Avg: 627.1959145236503 (1.0000) <0-05:34:58> 
+Ep:     422, Reward: 764.2404577765296 [196.416], Avg: 627.5198968954066 (1.0000) <0-05:35:46> 
+Ep:     423, Reward: 771.7578799996061 [137.246], Avg: 627.8600808178221 (1.0000) <0-05:36:40> 
+Ep:     424, Reward: 859.6586521247663 [90.551], Avg: 628.4054892208973 (1.0000) <0-05:37:34> 
+Ep:     425, Reward: 797.0813943136495 [149.976], Avg: 628.8014420497535 (1.0000) <0-05:38:29> 
+Ep:     426, Reward: 788.2457407152613 [174.909], Avg: 629.1748479014291 (1.0000) <0-05:39:19> 
+Ep:     427, Reward: 825.1621150339379 [58.023], Avg: 629.6327620769723 (1.0000) <0-05:40:07> 
+Ep:     428, Reward: 736.4657491066591 [292.665], Avg: 629.8817900187665 (1.0000) <0-05:40:55> 
+Ep:     429, Reward: 813.009031774407 [158.502], Avg: 630.307667325175 (1.0000) <0-05:41:43> 
+Ep:     430, Reward: 746.1298945065281 [191.916], Avg: 630.576396390561 (1.0000) <0-05:42:30> 
+Ep:     431, Reward: 908.2766974466258 [124.617], Avg: 631.2192211615242 (1.0000) <0-05:43:25> 
+Ep:     432, Reward: 739.516965140651 [249.778], Avg: 631.4693314247554 (1.0000) <0-05:44:18> 
+Ep:     433, Reward: 830.9587910438481 [200.552], Avg: 631.9289845575182 (1.0000) <0-05:45:08> 
+Ep:     434, Reward: 800.719160882614 [239.658], Avg: 632.3170079513691 (1.0000) <0-05:45:56> 
+Ep:     435, Reward: 771.6812805065442 [168.809], Avg: 632.6366507783305 (1.0000) <0-05:46:45> 
+Ep:     436, Reward: 881.4779855484201 [141.958], Avg: 633.2060817503443 (1.0000) <0-05:47:32> 
+Ep:     437, Reward: 701.5687351852305 [234.073], Avg: 633.3621608677756 (1.0000) <0-05:48:21> 
+Ep:     438, Reward: 871.7273405329025 [215.225], Avg: 633.9051339421836 (1.0000) <0-05:49:10> 
+Ep:     439, Reward: 801.7506681005391 [305.429], Avg: 634.2866010652709 (1.0000) <0-05:49:57> 
+Ep:     440, Reward: 828.1497274813689 [126.155], Avg: 634.7261999913845 (1.0000) <0-05:50:45> 
+Ep:     441, Reward: 858.4758771352098 [126.836], Avg: 635.2324209803976 (1.0000) <0-05:51:32> 
+Ep:     442, Reward: 784.4058844579301 [224.487], Avg: 635.5691556609338 (1.0000) <0-05:52:19> 
+Ep:     443, Reward: 842.5381957063266 [108.230], Avg: 636.0353021475225 (1.0000) <0-05:53:06> 
+Ep:     444, Reward: 725.7346221517516 [189.376], Avg: 636.23687365315 (1.0000) <0-05:53:52> 
+Ep:     445, Reward: 866.2632980867565 [225.837], Avg: 636.7526279680236 (1.0000) <0-05:54:40> 
+Ep:     446, Reward: 898.1071971258211 [198.549], Avg: 637.3373138050656 (1.0000) <0-05:55:27> 
+Ep:     447, Reward: 856.6596893520061 [140.111], Avg: 637.8268726790544 (1.0000) <0-05:56:15> 
+Ep:     448, Reward: 881.346505078362 [143.078], Avg: 638.3692326621264 (1.0000) <0-05:57:02> 
+Ep:     449, Reward: 819.8426867637243 [126.203], Avg: 638.7725070045743 (1.0000) <0-05:57:50> 
+Ep:     450, Reward: 831.5729663813563 [183.172], Avg: 639.2000024799108 (1.0000) <0-05:58:37> 
+Ep:     451, Reward: 933.9629097002149 [178.864], Avg: 639.8521328056195 (1.0000) <0-05:59:24> 
+Ep:     452, Reward: 811.4854134612879 [170.563], Avg: 640.2310142198704 (1.0000) <0-06:00:11> 
+Ep:     453, Reward: 887.9896991485302 [120.864], Avg: 640.7767381954842 (1.0000) <0-06:00:58> 
+Ep:     454, Reward: 845.4353538313358 [192.323], Avg: 641.2265373507279 (1.0000) <0-06:01:45> 
+Ep:     455, Reward: 767.5006369054151 [208.669], Avg: 641.5034542357163 (1.0000) <0-06:02:32> 
+Ep:     456, Reward: 876.9989479320284 [177.938], Avg: 642.0187616617476 (1.0000) <0-06:03:17> 
+Ep:     457, Reward: 880.0714748705979 [152.276], Avg: 642.5385274111119 (1.0000) <0-06:04:06> 
+Ep:     458, Reward: 886.1410170582809 [209.503], Avg: 643.0692517894281 (1.0000) <0-06:04:53> 
+Ep:     459, Reward: 889.3879725595841 [178.476], Avg: 643.6047272693633 (1.0000) <0-06:05:38> 
+Ep:     460, Reward: 851.4182244409731 [36.946], Avg: 644.0555157664817 (1.0000) <0-06:06:24> 
+Ep:     461, Reward: 815.1920997496154 [78.671], Avg: 644.4259412729388 (1.0000) <0-06:07:14> 
+Ep:     462, Reward: 849.8413604953819 [136.327], Avg: 644.8696030855142 (1.0000) <0-06:08:01> 
+Ep:     463, Reward: 814.7284118763541 [243.986], Avg: 645.2356781044599 (1.0000) <0-06:08:48> 
+Ep:     464, Reward: 844.8003833330673 [106.198], Avg: 645.6648495135537 (1.0000) <0-06:09:33> 
+Ep:     465, Reward: 817.2503993936591 [233.652], Avg: 646.0330588480604 (1.0000) <0-06:10:22> 
+Ep:     466, Reward: 900.8422007347722 [181.893], Avg: 646.5786887022075 (1.0000) <0-06:11:09> 
+Ep:     467, Reward: 882.3629384696461 [158.506], Avg: 647.0825012017106 (1.0000) <0-06:11:55> 
+Ep:     468, Reward: 927.9281408347335 [225.580], Avg: 647.6813191966637 (1.0000) <0-06:12:42> 
+Ep:     469, Reward: 834.481964350259 [203.358], Avg: 648.0787673778416 (1.0000) <0-06:13:30> 
+Ep:     470, Reward: 840.6318609701623 [185.586], Avg: 648.4875849863179 (1.0000) <0-06:14:18> 
+Ep:     471, Reward: 850.7640293125778 [123.735], Avg: 648.9161367751448 (1.0000) <0-06:15:06> 
+Ep:     472, Reward: 841.6686461195451 [37.339], Avg: 649.3236473657249 (1.0000) <0-06:15:54> 
+Ep:     473, Reward: 838.8716010452483 [188.196], Avg: 649.7235375633611 (1.0000) <0-06:16:42> 
+Ep:     474, Reward: 874.8323041720919 [155.349], Avg: 650.1974507562214 (1.0000) <0-06:17:29> 
+Ep:     475, Reward: 881.8467812523565 [197.134], Avg: 650.6841090135663 (1.0000) <0-06:18:15> 
+Ep:     476, Reward: 866.1215602399234 [175.354], Avg: 651.1357598547118 (1.0000) <0-06:19:00> 
+Ep:     477, Reward: 811.2914071716096 [119.875], Avg: 651.4708135101864 (1.0000) <0-06:19:50> 
+Ep:     478, Reward: 888.7016825491932 [215.361], Avg: 651.9660762847981 (1.0000) <0-06:20:36> 
+Ep:     479, Reward: 841.2082086992009 [37.498], Avg: 652.360330727328 (1.0000) <0-06:21:22> 
+Ep:     480, Reward: 779.7921370773508 [242.730], Avg: 652.6252617176607 (1.0000) <0-06:22:11> 
+Ep:     481, Reward: 761.459662079717 [247.526], Avg: 652.8510592287854 (1.0000) <0-06:22:58> 
+Ep:     482, Reward: 731.550579503561 [179.277], Avg: 653.0139981941576 (1.0000) <0-06:23:45> 
+Ep:     483, Reward: 660.8902190249266 [204.773], Avg: 653.0302713776923 (1.0000) <0-06:24:32> 
+Ep:     484, Reward: 653.1361030259441 [176.625], Avg: 653.0304895872762 (1.0000) <0-06:25:17> 
+Ep:     485, Reward: 751.6666564072568 [138.445], Avg: 653.2334446630375 (1.0000) <0-06:26:05> 
+Ep:     486, Reward: 702.2823721857653 [193.582], Avg: 653.334161146657 (1.0000) <0-06:26:52> 
+Ep:     487, Reward: 676.5793657517773 [237.755], Avg: 653.3817947626512 (1.0000) <0-06:27:37> 
+Ep:     488, Reward: 621.7749095234126 [229.186], Avg: 653.3171590055158 (1.0000) <0-06:28:22> 
+Ep:     489, Reward: 617.9261489577503 [252.590], Avg: 653.2449324543977 (1.0000) <0-06:29:07> 
+Ep:     490, Reward: 698.0351710432064 [268.014], Avg: 653.3361549362488 (1.0000) <0-06:29:51> 
+Ep:     491, Reward: 739.1117694845047 [167.203], Avg: 653.5104956162248 (1.0000) <0-06:30:36> 
+Ep:     492, Reward: 804.6544875563867 [135.316], Avg: 653.8170757215802 (1.0000) <0-06:31:21> 
+Ep:     493, Reward: 712.9054628785991 [209.973], Avg: 653.9366878413311 (1.0000) <0-06:32:04> 
+Ep:     494, Reward: 759.4677892115824 [203.015], Avg: 654.1498819855136 (1.0000) <0-06:32:50> 
+Ep:     495, Reward: 719.789624282841 [178.970], Avg: 654.282220175629 (1.0000) <0-06:33:35> 
+Ep:     496, Reward: 764.5239177616049 [196.005], Avg: 654.5040344564862 (1.0000) <0-06:34:20> 
+Ep:     497, Reward: 765.3251812262113 [152.853], Avg: 654.7265668797186 (1.0000) <0-06:35:04> 
+Ep:     498, Reward: 780.4820579836801 [109.770], Avg: 654.978581891951 (1.0000) <0-06:35:51> 
+Ep:     499, Reward: 758.3961452960946 [181.254], Avg: 655.1854170187593 (1.0000) <0-06:36:38> 

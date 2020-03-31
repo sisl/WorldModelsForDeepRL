@@ -1,0 +1,15 @@
+class PTCritic(torch.nn.Module):
+	def __init__(self, state_size, action_size=[1]):
+		super().__init__()
+		self.state_fc1 = torch.nn.Linear(state_size[-1], INPUT_LAYER) if len(state_size)!=3 else Conv(state_size, INPUT_LAYER)
+		self.state_fc2 = torch.nn.Linear(INPUT_LAYER, CRITIC_HIDDEN)
+		self.state_fc3 = torch.nn.Linear(CRITIC_HIDDEN, CRITIC_HIDDEN)
+		self.value = torch.nn.Linear(CRITIC_HIDDEN, action_size[-1])
+		self.apply(lambda m: torch.nn.init.xavier_normal_(m.weight) if type(m) in [torch.nn.Conv2d, torch.nn.Linear] else None)
+
+	def forward(self, state, action=None):
+		state = self.state_fc1(state).relu()
+		state = self.state_fc2(state).relu()
+		state = self.state_fc3(state).relu()
+		value = self.value(state)
+		return value

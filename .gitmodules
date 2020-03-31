@@ -1,0 +1,3 @@
+[submodule "envs/ViZDoom"]
+	path = envs/ViZDoom
+	url = https://github.com/mwydmuch/ViZDoom.git
