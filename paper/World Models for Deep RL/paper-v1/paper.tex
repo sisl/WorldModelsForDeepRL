@@ -1,0 +1,44 @@
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}  
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{subfigure}		% For subfigures
+\usepackage{microtype}      % microtypography
+\usepackage{graphicx}       % microtypography
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{breqn}          % dmath multiline
+\usepackage{url}            % simple URL typesetting
+\usepackage[backend=bibtex,style=ieee,mincitenames=1,maxcitenames=2,maxbibnames=20]{biblatex}
+\addbibresource{paper.bib}
+
+\usepackage[keeplastbox]{flushend}
+
+\IEEEoverridecommandlockouts
+\overrideIEEEmargins
+\title{\LARGE \bf World Models for Deep Reinforcement Learning}
+\author{Shawn Manuel$^{1}$ and Mykel J. Kochenderfer$^{2}$
+\thanks{$^{1}$Shawn Manuel is with the Department of Computer Science at Stanford University, Stanford, CA. Email: {\tt\small sman64@stanford.edu}}%
+\thanks{$^{2}$Mykel J. Kochenderfer is with the Department of Aeronautics and Astronautics at Stanford University, Stanford, CA. Email: {\tt\small mykel@stanford.edu}}%
+}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+\input{0_abstract}
+\input{1_introduction}
+\input{2_background}
+\input{3_worldmodel}
+\input{4_experiments}
+\input{5_conclusion}
+
+% \bibliography{paper}
+% \bibliographystyle{IEEEtran}
+\renewcommand*{\bibfont}{\small}
+\printbibliography
+
+
+\end{document}

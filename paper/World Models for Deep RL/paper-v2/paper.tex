@@ -1,0 +1,54 @@
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf} 
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{subfigure}		% For subfigures
+\usepackage{microtype}      % microtypography
+\usepackage{graphicx}       % microtypography
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{pdfpages}
+\usepackage{breqn}          % dmath multiline
+\usepackage{url}            % simple URL typesetting
+\usepackage{pgf}
+\usepackage[capitalize, noabbrev]{cleveref}
+\usepackage[backend=bibtex,style=ieee,mincitenames=1,maxcitenames=2,maxbibnames=20]{biblatex}
+\addbibresource{paper.bib}
+
+\renewcommand\algorithmicthen{}
+\renewcommand\algorithmicdo{}
+
+\usepackage[keeplastbox]{flushend}
+
+\definecolor{green}{rgb}{0.0, 0.5, 0.0}
+\newcommand{\add}[1]{\textcolor{green}{#1}}
+\newcommand{\remove}[1]{\textcolor{red}{#1}}
+\newcommand{\todo}[1]{\textbf{\textcolor{blue}{[[#1]]}}}
+\newcommand{\xiaobai}[1]{\textcolor{orange}{#1}}
+
+\IEEEoverridecommandlockouts
+\overrideIEEEmargins
+\title{\LARGE \bf World Models for Deep Reinforcement Learning}
+\author{Shawn Manuel$^{1}$, Xiaobai Ma$^{2}$, and Mykel J. Kochenderfer$^{2}$ 
+\thanks{$^{1}$Shawn Manuel is with the Department of Computer Science at Stanford University, Stanford, CA. Email: {\tt\small sman64@stanford.edu}}%
+\thanks{$^{2}$Xiaobai Ma and Mykel J. Kochenderfer are with the Department of Aeronautics and Astronautics at Stanford University, Stanford, CA. Email: {\tt\small mykel@stanford.edu}, {\tt\small maxiaoba@stanford.edu}}
+}
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+\input{0_abstract}
+\input{1_introduction}
+\input{2_background}
+\input{3_worldmodel}
+\input{4_experiments}
+\input{5_conclusion}
+
+\renewcommand*{\bibfont}{\small}
+\printbibliography
+
+\end{document}
