@@ -11,6 +11,7 @@ import matplotlib
 #     'text.usetex': True,
 #     'pgf.rcfonts': False,
 # })
+matplotlib.rcParams['pdf.fonttype'] = 42
 
 
 def read_ctrl(path):
@@ -123,8 +124,8 @@ def graph_CDC():
 		plt.title(f"Average Training Rewards for {env_name}")
 		plt.xlabel("Environment Step")
 		plt.ylabel("Evaluation Reward")
-		plt.legend(prop={'size': 6})
-		plt.savefig(f"./logs/graphs/{env_name}.pdf")
+		plt.legend(prop={'size': 10 - env_names.index(env_name)})
+		plt.savefig(f"./logs/graphs/{env_name}.pdf", bbox_inches='tight')
 		plt.show()
 		# plt.savefig(f"./logs/graphs/{env_name}.png")
 
