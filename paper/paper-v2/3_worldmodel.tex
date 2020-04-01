@@ -3,7 +3,7 @@
 In this section, we reintroduce the World Models architecture \cite{ha2018recurrent} in the context of reinforcement learning. A trained World Model can be incorporated in the RL training loop as shown in \cref{fig:worldmodel} to transform an image observation into a compressed representation that is then passed to the agent. This output consists of a latent encoding $z_t$ of the image from a VAE and the hidden state $h_t$ from a Gaussian Mixture Density RNN (MDRNN). The concatenation of these two vectors becomes the state feature representation, which the agent can treat as the environment's underlying state when learning an optimal policy.
 \begin{figure}[h]
 	\centering
-	\includegraphics[width=0.49\textwidth]{images/worldmodel2.pdf}
+	\includegraphics[width=0.49\textwidth]{images/worldmodel3.pdf}
 	\caption{MDP Loop with a World Model}\label{fig:worldmodel}
 \end{figure}
 
@@ -16,7 +16,7 @@ A VAE consists of an encoder network that compresses an input image $s_t$ into a
 where the first term minimizes the difference between the reconstructed and input image and the second term penalizes large shifts in the conditional latent state distribution $p(z_t \mid s_t)$ from a unit normal. A VAE is ideal for this task as it learns to encode the most important sources of variation from the distribution of training images within a small linear vector. The KL divergence term ensures that the model is able to sufficiently represent less frequent states without overfitting to a particular region of the state space.
 \begin{figure}[h]
 	\centering
-	\includegraphics[width=0.49\textwidth]{images/vaes.pdf}
+	\includegraphics[width=0.49\textwidth]{images/vaes2.pdf}
 	\caption{Flow diagram of a VAE \cite{ha2018recurrent}}\label{fig:vae}
 \end{figure}
 
@@ -25,7 +25,7 @@ where the first term minimizes the difference between the reconstructed and inpu
 While the VAE transforms a high-dimensional image into a low dimensional latent vector, it is only a static representation at a single point in time and lacks information about the temporal dynamics of the environment. Therefore, an RNN is trained to encode temporal information over a sequence of latent vectors. \Citeauthor{ha2018recurrent} utilized a Long-Short-Term-Memory (LSTM) to model the temporal changes in the next state through its hidden LSTM state $h_{t+1}$ calculated from the current latent vector $z_t$, chosen action $a_t$ and its current hidden state $h_t$~\cite{ha2018recurrent}. As the distribution of next states is often stochastic, the output of the LSTM is passed to a Gaussian-Mixture Density Network (MDN) \cite{bishop1994mixture} represented in \cref{fig:mdrnn} as a linear layer which outputs the mean $(\mu)$, standard deviation $(\sigma)$, and mixing weights $(\textbf{w})$, for a specified number of Gaussian distributions. The predicted next latent state can be sampled by first sampling a Gaussian index from the mixture weights $w$ and then sampling the latent vector $\hat{z}_{t+1}$ from the selected Gaussian. 
 \begin{figure}[h]
 	\centering
-	\includegraphics[width=0.5\textwidth]{images/MDRNN2.pdf}
+	\includegraphics[width=0.5\textwidth]{images/MDRNN3.pdf}
 	\caption{Flow diagram of a MDRNN}\label{fig:mdrnn}
 \end{figure}
 
@@ -51,7 +51,7 @@ This section describes the process of training RL agents using a trained World M
 Given a pre-trained World Model as the output from \cref{alg:wm}, the RL agent can focus solely on identifying the optimal mapping from latent features to actions that maximize total reward. \cref{alg:rl} describes the procedure for stepping through the environment $\mathcal{E}$ with a World Model consisting of the VAE $V$ and MDRNN $M$ that are either trained using \cref{alg:wm} or loaded from a previously trained World Model on the same environment $\mathcal{E}$. Then, the training of an RL policy $\pi$ towards an optimal policy occurs over a specified number of training trajectories. At the start of each training trajectory, the MDRNN hidden state $h$ is initialized with \textsc{InitHidden}, the initial observation $s$ is sampled from the environment with \textsc{InitState}, and the latent encoding $z$ of the initial image observation is sampled from the VAE. The flag $d$ signifying reaching a terminal state is initialized to false. Then, until a terminal state is reached, the RL training loop proceeds with the \textsc{Step} function applying each agent action $a$ to the environment and outputting the next observation $s'$, reward $r$ and updated terminal flag $d$. The observations $s$ and $s'$ are replaced with the latent state $[z,h]$ and next latent state $[z',h']$, where $z$ and $h$ are the outputs of the VAE $V$ and MDRNN $M$ respectively. The agent is then given the updated experience tuple with latent states using the where it can store or use in a training update through the \textsc{Train} function implemented according to a specified RL algorithm.
 
 \begin{algorithm}[t]
-   % \SetAlgoLined
+  % \SetAlgoLined
     \caption{Training Loop for World Model}\label{alg:wm}
     \begin{algorithmic}[1] 
         \Procedure{TrainWorldModel}{$\mathcal{E}, S, N$} 
@@ -103,9 +103,9 @@ Given a pre-trained World Model as the output from \cref{alg:wm}, the RL agent c
 
 \begin{figure*}[ht!]
 	\centering
-    \includegraphics[width=0.325\linewidth]{images/CarRacing-v0.pdf}
-    \includegraphics[width=0.33\linewidth]{images/take_cover.pdf}
-    \includegraphics[width=0.32\linewidth]{images/defend_the_line.pdf}
+    \includegraphics[width=0.325\linewidth]{images/CarRacingv02.pdf}
+    \includegraphics[width=0.33\linewidth]{images/take_cover2.pdf}
+    \includegraphics[width=0.32\linewidth]{paper-v2/images/defend_the_line2.pdf}
     \caption{The rolling average evaluation rewards over the previous $100000$ steps for different RL algorithms trained in the CarRacing-v0 (left), take_cover (mid), and defend_the_line (right) environments. In each plot, the solid thick lines represent training with the pre-trained World Model and dashed thick lines represent training using convolutional layers. The thin lines represent evaluation rewards every $1000$ steps.}\label{fig:res}
 \end{figure*}
 

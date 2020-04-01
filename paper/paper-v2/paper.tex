@@ -9,10 +9,9 @@
 \usepackage{amsfonts}       % blackboard math symbols
 \usepackage{booktabs}       % professional-quality tables
 \usepackage{nicefrac}       % compact symbols for 1/2, etc.
-\usepackage{pdfpages}
 \usepackage{breqn}          % dmath multiline
 \usepackage{url}            % simple URL typesetting
-\usepackage{pgf}
+\usepackage[bookmarks=true]{hyperref}
 \usepackage[capitalize, noabbrev]{cleveref}
 \usepackage[backend=bibtex,style=ieee,mincitenames=1,maxcitenames=2,maxbibnames=20]{biblatex}
 \addbibresource{paper.bib}
@@ -21,12 +20,6 @@
 \renewcommand\algorithmicdo{}
 
 \usepackage[keeplastbox]{flushend}
-
-\definecolor{green}{rgb}{0.0, 0.5, 0.0}
-\newcommand{\add}[1]{\textcolor{green}{#1}}
-\newcommand{\remove}[1]{\textcolor{red}{#1}}
-\newcommand{\todo}[1]{\textbf{\textcolor{blue}{[[#1]]}}}
-\newcommand{\xiaobai}[1]{\textcolor{orange}{#1}}
 
 \IEEEoverridecommandlockouts
 \overrideIEEEmargins
