@@ -1,5 +1,5 @@
 Box2D==2.3.2
-certifi==2019.11.28
+certifi==2022.12.7
 cloudpickle==1.2.2
 cma==2.7.0
 cycler==0.10.0
